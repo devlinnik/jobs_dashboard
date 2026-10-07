@@ -65,8 +65,10 @@ def main():
         else: raise AssertionError('UI server did not start')
         server_files = temp/'server'; server_files.mkdir()
         (server_files/'index.php').write_text('<?php echo "Initial";')
+        (server_files/'cache').mkdir(); (server_files/'cache/result.txt').write_text('keep ignored')
+        (server_files/'server.log').write_text('keep log')
         bare = git_host['bare']
-        ssh_port, key = stack.enter_context(ssh_server({'GIT_SSL_CAINFO':str(git_host['ca']), 'NO_PROXY':'127.0.0.1,localhost'}, home=str(temp)))
+        ssh_port, key = stack.enter_context(ssh_server({'GIT_SSL_CAINFO':str(git_host['ca']), 'NO_PROXY':'127.0.0.1,localhost'}, home=str(temp), writable=True))
         with sync_playwright() as playwright:
             executable = os.environ.get('CHROMIUM_PATH')
             if not executable and Path('/usr/bin/chromium').exists(): executable = '/usr/bin/chromium'
@@ -75,7 +77,7 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            expect(page.locator('#app-version')).to_have_text('v1.6.0')
+            expect(page.locator('#app-version')).to_have_text('v1.7.0')
             assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == 'light'
             assert page.evaluate("parseFloat(getComputedStyle(document.body).fontSize)") >= 16
             page.locator('[data-nav=ssh-profiles]').click()
@@ -175,6 +177,33 @@ def main():
             page.locator('[data-detail-action=check]').click()
             expect(page.locator('.big-value').first).to_contain_text('HTTP 200')
             page.locator('[data-tab=git]').click()
+            expect(page.locator('#gitignore-status')).to_contain_text('Файл отсутствует', timeout=20000)
+            page.locator('[data-git-action=ignore]').click()
+            expect(page.locator('#gitignore-content')).to_be_enabled(timeout=20000)
+            page.locator('#gitignore-content').fill('# Server project rules\n')
+            page.locator('#gitignore-pick').click()
+            expect(page.locator('[data-ignore-path="cache"]')).to_be_visible(timeout=20000)
+            page.locator('[data-ignore-open="cache"]').click()
+            expect(page.locator('[data-ignore-path="cache/result.txt"]')).to_be_visible(timeout=20000)
+            page.locator('#gitignore-up').click()
+            expect(page.locator('[data-ignore-path="cache"]')).to_be_visible(timeout=20000)
+            page.locator('[data-ignore-path="cache"]').check()
+            page.locator('[data-ignore-path="server.log"]').check()
+            page.locator('#gitignore-add').click()
+            expect(page.locator('#gitignore-content')).to_have_value('# Server project rules\n/cache/\n/server.log\n')
+            screenshot = ROOT/'test-results'; screenshot.mkdir(exist_ok=True)
+            page.screenshot(path=str(screenshot/'gitignore-editor.png'), animations='disabled')
+            page.locator('#gitignore-save').click(); page.locator('#confirm-accept').click()
+            expect(page.locator('#gitignore-dialog')).not_to_be_visible(timeout=20000)
+            expect(page.locator('#gitignore-status')).to_contain_text('Файл существует', timeout=20000)
+            assert (server_files/'cache/result.txt').read_text() == 'keep ignored'
+            expect(page.locator('.git-file')).to_have_count(2)
+            page.locator('[data-git-action=ignore]').click()
+            expect(page.locator('#gitignore-content')).to_be_enabled(timeout=20000)
+            assert '# Server project rules' in page.locator('#gitignore-content').input_value()
+            page.locator('#gitignore-content').fill(page.locator('#gitignore-content').input_value() + '*.tmp\n')
+            page.locator('#gitignore-save').click(); page.locator('#confirm-accept').click()
+            expect(page.locator('#gitignore-dialog')).not_to_be_visible(timeout=20000)
             page.locator('[data-git-action=check]').click()
             expect(page.get_by_text('Репозиторий не подключён. Выберите его через кнопку «Подключить репозиторий».',exact=True)).to_be_visible()
             page.locator('[data-git-action=attach]').click()
@@ -202,7 +231,7 @@ def main():
             expect(page.locator('#outgoing-commits')).to_contain_text('Browser Author')
             assert subprocess.run(['git','-C',str(bare),'rev-parse','--verify','main'],capture_output=True).returncode != 0
             assert_toast_above_dialog(page, '#detail-dialog', 'создан на сервере')
-            page.screenshot(path=str(screenshot/'git-outgoing.png'), animations='disabled')
+            page.screenshot(path=str(screenshot/'git-outgoing.png, gitignore-editor.png'), animations='disabled')
             page.locator('#git-history-panel [data-git-action=push]').click()
             expect(page.locator('#confirm-dialog')).to_be_visible()
             expect(page.locator('#confirm-extra')).to_contain_text('Browser Author')
@@ -266,7 +295,7 @@ def main():
                 assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), f'Horizontal overflow at {width}px'
             assert errors == [], errors
             browser.close()
-            print('UI smoke passed: light theme, larger fonts, clickable notifications above nested modals, project scrolling, SSH/Git profiles, provider authorization, repository picker/attach/access check, profile author, local commits/outgoing history/separate HTTPS Git push, SFTP, CRUD, diff/commit, journal, filters, PIN, XSS, responsive layout. Screenshots: test-results/dashboard.png, ssh-browser.png, git-profiles.png, git-notification.png, git-outgoing.png')
+            print('UI smoke passed: light theme, larger fonts, clickable notifications above nested modals, project scrolling, SSH/Git profiles, provider authorization, repository picker/attach/access check, visual .gitignore creation/editing/picker, profile author, local commits/outgoing history/separate HTTPS Git push, SFTP, CRUD, diff/commit, journal, filters, PIN, XSS, responsive layout. Screenshots: test-results/dashboard.png, ssh-browser.png, git-profiles.png, git-notification.png, git-outgoing.png, gitignore-editor.png')
 
 
 if __name__ == '__main__': main()

@@ -67,15 +67,48 @@ class ReadOnlySFTP(paramiko.SFTPServerInterface):
             return paramiko.SFTPServer.convert_errno(exc.errno)
 
 
+class WritableSFTP(ReadOnlySFTP):
+    def lstat(self, path):
+        try:
+            return paramiko.SFTPAttributes.from_stat(os.lstat(path))
+        except OSError as exc:
+            return paramiko.SFTPServer.convert_errno(exc.errno)
+
+    def open(self, path, flags, attr):
+        try:
+            descriptor = os.open(path, flags, attr.st_mode or 0o644)
+            mode = 'r+b' if flags & os.O_RDWR else 'wb' if flags & os.O_WRONLY else 'rb'
+            stream = os.fdopen(descriptor, mode)
+            handle = paramiko.SFTPHandle(flags)
+            handle.readfile = stream; handle.writefile = stream
+            return handle
+        except OSError as exc:
+            return paramiko.SFTPServer.convert_errno(exc.errno)
+
+    def chattr(self, path, attr):
+        try:
+            paramiko.SFTPServer.set_file_attr(path, attr)
+            return paramiko.SFTP_OK
+        except OSError as exc:
+            return paramiko.SFTPServer.convert_errno(exc.errno)
+
+    def remove(self, path):
+        try:
+            os.remove(path)
+            return paramiko.SFTP_OK
+        except OSError as exc:
+            return paramiko.SFTPServer.convert_errno(exc.errno)
+
+
 @contextmanager
-def ssh_server(env=None, home=None):
+def ssh_server(env=None, home=None, writable=False):
     key = paramiko.RSAKey.generate(2048)
     listener = socket.socket(); listener.bind(('127.0.0.1',0)); listener.listen(); listener.settimeout(.2)
     port = listener.getsockname()[1]
     stopped = threading.Event(); transports = []
     def client(sock):
         transport = paramiko.Transport(sock); transports.append(transport); transport.add_server_key(key)
-        transport.set_subsystem_handler('sftp', paramiko.SFTPServer, ReadOnlySFTP, home=home)
+        transport.set_subsystem_handler('sftp', paramiko.SFTPServer, WritableSFTP if writable else ReadOnlySFTP, home=home)
         try:
             transport.start_server(server=TestServer(env))
             channels = []

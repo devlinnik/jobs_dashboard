@@ -265,9 +265,10 @@ async function loadGit() {
   try {
     const data = await api(`/projects/${id}/git`);
     if (id !== selectedId || activeTab !== 'git') return;
-    gitData = data; gitHistory = null; renderGit(); await loadGitHistory(true);
+    gitData = data; gitHistory = null; renderGit(); mountGitIgnore(); await loadGitHistory(true);
   } catch (error) {
     if (id === selectedId && activeTab === 'git') $('#detail-content').innerHTML = `<div class="error-panel">${escape(error.message)}<br><button class="button secondary" data-detail-action="edit">Настроить подключение</button> <button class="button secondary" data-detail-action="git">Повторить</button></div>`;
+    if (id === selectedId && activeTab === 'git') mountGitIgnore();
   }
 }
 function renderGit() {
@@ -288,6 +289,7 @@ $('#detail-content').addEventListener('click', event => {
   if (button) busy(button, () => gitAction(button.dataset.gitAction));
 });
 async function gitAction(action) {
+  if (action === 'ignore') return openGitIgnore();
   if (action === 'refresh') return loadGit();
   if (action === 'fetch-commits') return loadGitHistory(true);
   const p = getProject(), id = p.id;
@@ -342,6 +344,95 @@ function renderGitHistory() {
   const entries = list => list.map(c => `<article class="commit-row"><code>${escape(c.short_hash)}</code><div><strong>${escape(c.subject)}</strong><p>${escape(c.author)} &lt;${escape(c.email)}&gt; · ${fullDate(c.date)}</p></div></article>`).join('');
   panel.innerHTML = `<div class="section-heading"><h3>Коммиты на отправку${h.outgoing_known ? ' · ' + h.ahead : ''}</h3><button class="button secondary small" data-git-action="fetch-commits">Обновить с origin</button></div><p id="git-history-status" class="hint">${escape(h.message || '')}</p>${h.author ? `<p class="hint">Автор следующего коммита: <strong>${escape(h.author.name)} &lt;${escape(h.author.email)}&gt;</strong> · ${escape(h.author.source)}</p>` : ''}${h.error ? `<p class="git-info git-warning">${escape(h.error)}</p>` : ''}${h.behind ? `<p class="git-info git-warning">На origin ${h.behind} коммитов, которых нет на сервере. При расхождении истории отправка остановится; рабочие файлы сохраняются.</p>` : ''}${h.outgoing_known ? h.outgoing.length ? `<div id="outgoing-commits" class="commit-list">${entries(h.outgoing)}</div><p class="hint">Отправятся все неотправленные коммиты текущей ветки. ${h.ahead > h.outgoing.length ? 'Показаны последние 50.' : ''}</p><button class="button primary" data-git-action="push" ${h.error || h.behind ? 'disabled' : ''}>Отправить коммиты (${h.ahead})</button>` : '<p class="hint">Неотправленных коммитов нет.</p>' : '<p class="hint">История на сервере доступна ниже. Для точного списка на отправку обновите origin.</p>'}<details class="commit-history" ${h.outgoing_known ? '' : 'open'}><summary>История текущей ветки · последние ${h.commits.length}</summary><div id="local-commits" class="commit-list">${entries(h.commits) || '<p class="hint">Коммитов пока нет.</p>'}</div></details>`;
 }
+
+let ignoreEditor = null, ignoreRequest = 0, ignoreFolder = null, ignoreChoices = new Map();
+function mountGitIgnore() {
+  const id = selectedId;
+  $('#detail-content').insertAdjacentHTML('afterbegin', '<section class="ignore-summary"><div><h3>.gitignore</h3><p id="gitignore-status" class="hint">Проверяем файл на сервере…</p></div><button class="button secondary" data-git-action="ignore">Открыть редактор</button></section>');
+  api(`/projects/${id}/git/ignore`).then(data => {
+    if (selectedId !== id || activeTab !== 'git' || !$('#gitignore-status')) return;
+    $('#gitignore-status').textContent = data.exists ? 'Файл существует. Можно изменить правила или выбрать новые пути.' : 'Файл отсутствует. Создайте его и выберите, что исключить из Git.';
+    $('[data-git-action="ignore"]').textContent = data.exists ? 'Редактировать .gitignore' : 'Создать .gitignore';
+  }).catch(error => {
+    if (selectedId === id && $('#gitignore-status')) $('#gitignore-status').textContent = error.message;
+  });
+}
+async function openGitIgnore() {
+  const id = selectedId, sequence = ++ignoreRequest;
+  ignoreEditor = null;
+  $('#gitignore-error').textContent = ''; $('#gitignore-content').value = '';
+  $('#gitignore-info').textContent = 'Читаем .gitignore с сервера…';
+  ['#gitignore-save','#gitignore-pick','#gitignore-content'].forEach(q => $(q).disabled = true);
+  $('#gitignore-dialog').showModal();
+  try {
+    const data = await api(`/projects/${id}/git/ignore`);
+    if (sequence !== ignoreRequest || !$('#gitignore-dialog').open) return;
+    ignoreEditor = {id, ...data}; $('#gitignore-content').value = data.content;
+    $('#gitignore-info').textContent = `${getProject().ssh_path}/.gitignore · ${data.exists ? 'Редактирование существующего файла' : 'Файл отсутствует — будет создан при сохранении'}`;
+    ['#gitignore-save','#gitignore-pick','#gitignore-content'].forEach(q => $(q).disabled = false);
+  } catch (error) {
+    if (sequence === ignoreRequest && $('#gitignore-dialog').open) $('#gitignore-error').textContent = error.message;
+  }
+}
+$('#gitignore-dialog').addEventListener('close', () => { ignoreRequest++; ignoreEditor = null; });
+$('#gitignore-form').addEventListener('submit', event => {
+  event.preventDefault();
+  busy($('#gitignore-save'), async () => {
+    const editor = ignoreEditor; if (!editor) return;
+    const content = $('#gitignore-content').value;
+    $('#gitignore-error').textContent = '';
+    if (!await confirmAction(editor.exists ? 'Сохранить изменения .gitignore?' : 'Создать .gitignore?', 'Правила будут записаны в корень проекта на сервере. Уже отслеживаемые файлы останутся в Git.', content || '(пустой файл)')) return;
+    try {
+      const result = await api(`/projects/${editor.id}/git/ignore`, {method:'PUT',body:{content,snapshot:editor.snapshot,confirm:true}});
+      $('#gitignore-dialog').close(); toast(result.message);
+      if (selectedId === editor.id && activeTab === 'git') await loadGit();
+    } catch (error) { $('#gitignore-error').textContent = error.message; }
+  });
+});
+let ignoreBrowseRequest = 0;
+async function loadIgnoreFolder(path = '') {
+  const id = ignoreEditor?.id, sequence = ++ignoreBrowseRequest; if (!id) return;
+  ignoreFolder = null; $('#gitignore-files').textContent = 'Читаем каталог…';
+  $('#gitignore-picker-error').textContent = ''; $('#gitignore-picker-note').textContent = '';
+  $('#gitignore-search').value = ''; $('#gitignore-up').disabled = true;
+  try {
+    const data = await api(`/projects/${id}/git/ignore/files?path=${encodeURIComponent(path)}`);
+    if (sequence !== ignoreBrowseRequest || !$('#gitignore-picker-dialog').open) return;
+    ignoreFolder = data; $('#gitignore-path').textContent = '/' + data.path;
+    $('#gitignore-up').disabled = data.parent === null;
+    $('#gitignore-picker-note').textContent = data.truncated ? 'Показана часть каталога (до 1000 элементов). Остальные правила можно вписать в редактор вручную.' : 'Отметьте файл или всю папку. Кнопка «Открыть» позволяет выбрать отдельные элементы внутри папки. По ссылкам проводник не переходит.';
+    renderIgnoreFolder();
+  } catch (error) {
+    if (sequence !== ignoreBrowseRequest || !$('#gitignore-picker-dialog').open) return;
+    $('#gitignore-files').textContent = ''; $('#gitignore-picker-error').textContent = error.message;
+  }
+}
+function renderIgnoreFolder() {
+  if (!ignoreFolder) return;
+  const term = $('#gitignore-search').value.toLocaleLowerCase();
+  const entries = ignoreFolder.entries.filter(e => e.name.toLocaleLowerCase().includes(term));
+  $('#gitignore-files').innerHTML = entries.map(e => `<div class="ignore-file-row"><label><input type="checkbox" data-ignore-path="${escape(e.path)}" ${ignoreChoices.has(e.path) ? 'checked' : ''}><span>${e.directory ? icon('folder') : icon('git')}</span><span>${escape(e.name)}${e.directory ? '/' : ''}${e.symlink ? ' (ссылка)' : ''}</span></label>${e.directory ? `<button type="button" class="button secondary small" data-ignore-open="${escape(e.path)}">Открыть</button>` : ''}</div>`).join('') || '<p class="hint">Нет файлов и папок для выбора.</p>';
+}
+$('#gitignore-pick').onclick = () => {
+  ignoreChoices = new Map(); $('#gitignore-selection').textContent = 'Выбрано: 0'; $('#gitignore-add').disabled = true;
+  $('#gitignore-picker-dialog').showModal(); loadIgnoreFolder();
+};
+$('#gitignore-picker-dialog').addEventListener('close', () => { ignoreBrowseRequest++; });
+$('#gitignore-search').oninput = renderIgnoreFolder;
+$('#gitignore-root').onclick = () => loadIgnoreFolder();
+$('#gitignore-up').onclick = () => { if (ignoreFolder?.parent !== null) loadIgnoreFolder(ignoreFolder?.parent || ''); };
+$('#gitignore-files').onclick = event => { const button = event.target.closest('[data-ignore-open]'); if (button) loadIgnoreFolder(button.dataset.ignoreOpen); };
+$('#gitignore-files').onchange = event => {
+  const path = event.target.dataset.ignorePath, entry = ignoreFolder?.entries.find(e => e.path === path); if (!entry) return;
+  if (event.target.checked) ignoreChoices.set(path, entry.rule); else ignoreChoices.delete(path);
+  $('#gitignore-selection').textContent = 'Выбрано: ' + ignoreChoices.size; $('#gitignore-add').disabled = !ignoreChoices.size;
+};
+$('#gitignore-add').onclick = () => {
+  const input = $('#gitignore-content'), existing = new Set(input.value.split(/\r?\n/));
+  const rules = [...ignoreChoices.values()].filter(rule => !existing.has(rule));
+  if (rules.length) input.value += (input.value && !input.value.endsWith('\n') ? '\n' : '') + rules.join('\n') + '\n';
+  $('#gitignore-picker-dialog').close(); input.focus(); toast(`Добавлено правил: ${rules.length}. Нажмите «Сохранить .gitignore», чтобы записать их на сервер.`);
+};
 
 function eventsHTML(events) {
   if (!events.length) return '<div class="events-empty">Событий пока нет. Здесь появятся результаты проверок и операций.</div>';

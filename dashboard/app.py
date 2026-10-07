@@ -14,10 +14,11 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, field_validator
 from .store import Store, now
 from .security import Sessions, hash_pin, verify_pin
-from .models import ProjectInput, SettingsInput, SyncInput, InitInput, SSHProfileInput, GitProfileInput, GitAttachInput, GitPushInput, web_url
+from .models import ProjectInput, SettingsInput, SyncInput, InitInput, SSHProfileInput, GitProfileInput, GitAttachInput, GitPushInput, GitIgnoreInput, web_url
 from .remote import connect, inspect_host, RemoteError
 from .monitor import Monitor, probe_script
 from . import gitops
+from . import gitignore
 from .version import app_info
 from .gitprovider import Provider
 
@@ -440,6 +441,21 @@ def create_app(directory=None, start_monitor=True):
         store.event(pid, 'success', result['message'])
         monitor.due[pid] = 0
         return result
+
+    @app.get('/api/projects/{pid}/git/ignore', dependencies=auth)
+    async def read_gitignore(pid: str):
+        return await operation(pid, gitignore.read)
+
+    @app.put('/api/projects/{pid}/git/ignore', dependencies=auth)
+    async def save_gitignore(pid: str, body: GitIgnoreInput):
+        result = await operation(pid, gitignore.save, body)
+        store.event(pid, 'success', result['message'])
+        monitor.due[pid] = 0
+        return result
+
+    @app.get('/api/projects/{pid}/git/ignore/files', dependencies=auth)
+    async def browse_gitignore(pid: str, path: str = Query(default='', max_length=2048)):
+        return await operation(pid, gitignore.browse, path)
 
     @app.get('/api/projects/{pid}/git/diff', dependencies=auth)
     async def git_diff(pid: str, path: str):

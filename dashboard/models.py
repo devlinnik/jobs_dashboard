@@ -214,3 +214,9 @@ class GitPushInput(BaseModel):
     expected_head: str = Field(default='', max_length=64)
     expected_branch: str = Field(default='', max_length=100)
     expected_remote: str = Field(default='', max_length=2048)
+
+
+class GitIgnoreInput(BaseModel):
+    content: str = Field(max_length=256_000)
+    snapshot: str = Field(min_length=1, max_length=64)
+    confirm: bool = False
