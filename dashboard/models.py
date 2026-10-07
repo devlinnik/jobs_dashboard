@@ -97,12 +97,29 @@ class SSHProfileInput(BaseModel):
     ssh_key: str = Field(default='', max_length=1024)
     ssh_password: str | None = Field(default=None, max_length=2048)
     clear_password: bool = False
+    hosting: bool = False
+    hosting_limit_gb: float = Field(default=0, ge=0, le=100000, allow_inf_nan=False)
+    hosting_unit: str = 'GB'
+    hosting_path: str = Field(default='', max_length=1024)
+
+    @field_validator('hosting_path')
+    @classmethod
+    def hosting_root(cls, value):
+        value = value.strip()
+        if value and (not value.startswith('/') or value.rstrip('/') == '' or
+                      '..' in value.split('/') or any(c in value for c in '\x00\r\n')):
+            raise ValueError('Укажите абсолютный путь к аккаунту хостинга, кроме корня /')
+        return value.rstrip('/')
 
     @model_validator(mode='after')
     def validate_connection(self):
         clean = ProjectInput(name=self.name, ssh_host=self.ssh_host, ssh_port=self.ssh_port,
                              ssh_user=self.ssh_user, ssh_key=self.ssh_key)
         self.name, self.ssh_host, self.ssh_user, self.ssh_key = clean.name, clean.ssh_host, clean.ssh_user, clean.ssh_key
+        if self.hosting_unit not in ('GB', 'GiB'):
+            raise ValueError('Единица тарифа: GB или GiB')
+        if self.hosting and (not self.hosting_path or self.hosting_limit_gb <= 0):
+            raise ValueError('Для хостинга укажите лимит тарифа и корневую папку всего аккаунта')
         return self
 
 

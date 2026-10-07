@@ -325,6 +325,13 @@ def create_app(directory=None, start_monitor=True):
         async with profiles_lock:
             old = store.profile(profile_id)
             data = old | body.model_dump(exclude={'ssh_password','clear_password'})
+            for key in ('hosting', 'hosting_limit_gb', 'hosting_unit', 'hosting_path'):
+                if key not in body.model_fields_set and key in old:
+                    data[key] = old[key]
+            try:
+                SSHProfileInput.model_validate(data)
+            except ValueError as exc:
+                raise HTTPException(422, 'Для хостинга проверьте положительный лимит тарифа, единицу и абсолютный путь аккаунта.') from exc
             if any(old[k] != data[k] for k in ('ssh_host','ssh_port')):
                 data['ssh_fingerprint'] = ''
             if body.ssh_password is not None:
@@ -363,7 +370,10 @@ def create_app(directory=None, start_monitor=True):
     async def profile_test(profile_id: str):
         profile = store.profile(profile_id) | {'ssh_path': ''}
         def test():
-            with connect(store, profile, require_project=False):
+            with connect(store, profile, require_project=False) as conn:
+                if profile.get('hosting'):
+                    disk = conn.disk()
+                    return {'ok': True, 'disk': disk, 'message': 'SSH подключён. Папка аккаунта измерена; остаток тарифа (оценка): ' + str(round(disk['free'] / (1024**3 if disk['unit'] == 'GiB' else 1000**3), 2)) + ' ' + disk['unit']}
                 return {'ok': True, 'message': 'SSH-профиль подключён. Теперь выберите папку для проекта.'}
         return await asyncio.to_thread(test)
 
@@ -460,6 +470,10 @@ def create_app(directory=None, start_monitor=True):
     @app.get('/api/projects/{pid}/git/diff', dependencies=auth)
     async def git_diff(pid: str, path: str):
         return {'diff': await operation(pid, gitops.diff, path)}
+
+    @app.get('/api/projects/{pid}/git/diagnostics', dependencies=auth)
+    async def git_diagnostics(pid: str):
+        return await operation(pid, gitops.diagnostics, store.settings())
 
     @app.get('/api/projects/{pid}/git/commits', dependencies=auth)
     async def git_commits(pid: str):

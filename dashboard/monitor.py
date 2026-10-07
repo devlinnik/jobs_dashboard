@@ -87,12 +87,17 @@ class Monitor:
         try:
             with connect(self.store, project, require_project=False) as conn:
                 result['ssh'] = {'ok': True}
+                if project.get('hosting') and project['disk_mode'] != 'off':
+                    try:
+                        result['disk'] = conn.disk()
+                    except (RemoteError, ValueError) as exc:
+                        result['disk'] = {'error': str(exc)}
                 try:
                     result['directory'] = {'ok': True, 'path': conn.check_directory()}
                 except RemoteError as exc:
                     result['directory'] = {'ok': False, 'error': str(exc)}
                     return result
-                if project['disk_mode'] == 'ssh':
+                if project['disk_mode'] == 'ssh' and not project.get('hosting'):
                     try:
                         result['disk'] = conn.disk()
                     except (RemoteError, ValueError):
@@ -151,7 +156,8 @@ class Monitor:
             free, total = float(data['free']), float(data['total'])
             if not (math.isfinite(free) and math.isfinite(total)) or not 0 <= free <= total or total <= 0:
                 raise ValueError()
-            return {'free': free, 'total': total, 'free_percent': round(free / total * 100, 1), 'source': 'HTTPS'}
+            return {'free': free, 'total': total, 'free_percent': round(free / total * 100, 1), 'source': 'HTTPS',
+                    'kind': 'filesystem', 'note': 'PHP-проба показывает общую файловую систему; квота хостинга не учитывается.'}
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             return {'error': 'HTTP-проба недоступна или вернула неверные данные'}
 
@@ -174,7 +180,7 @@ class Monitor:
                     # result before releasing the project lock or closing the database.
                     server_state = await job
                 state.update(server_state)
-            if project['disk_mode'] == 'http':
+            if project['disk_mode'] == 'http' and not project.get('hosting'):
                 state['disk'] = await self.disk_http(project)
             issues = []
             if state.get('web', {}).get('ok') is False:
@@ -187,7 +193,7 @@ class Monitor:
             if disk.get('error'):
                 issues.append('Диск: ' + disk['error'])
             elif disk and disk['free_percent'] < project['disk_threshold']:
-                issues.append('Мало места: свободно ' + str(disk['free_percent']) + '%')
+                issues.append(('Мало места по оценке тарифа хостинга: ' if disk.get('estimated') else 'Мало места: ') + 'свободно ' + str(disk['free_percent']) + '%')
             if state.get('git', {}).get('error'):
                 issues.append('Git: ' + state['git']['error'])
             if state.get('git', {}).get('auto_error'):

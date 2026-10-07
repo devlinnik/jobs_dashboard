@@ -109,7 +109,9 @@ class Store:
                 return project.copy()
             profile = self.profile(project['ssh_profile_id'])
             fields = ('ssh_host', 'ssh_port', 'ssh_user', 'ssh_key', 'ssh_password_enc', 'ssh_fingerprint')
-            return project | {k: profile.get(k, '') for k in fields} | {'ssh_profile_name': profile['name']}
+            return project | {k: profile.get(k, '') for k in fields} | {'ssh_profile_name': profile['name'],
+                'hosting': profile.get('hosting', False), 'hosting_limit_gb': profile.get('hosting_limit_gb', 0),
+                'hosting_unit': profile.get('hosting_unit', 'GB'), 'hosting_path': profile.get('hosting_path', '')}
 
     def git_profiles(self):
         with self.lock:

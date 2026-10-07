@@ -232,6 +232,37 @@ def author_identity(conn, settings):
     return {'name': settings['git_name'], 'email': settings['git_email'], 'source': 'Настройки приложения'}
 
 
+def diagnostics(conn, settings):
+    """Read-only checks; never return arbitrary Git stderr or credentials."""
+    checks = []
+    code, out, _ = conn.run('git --version')
+    checks.append({'ok': code == 0, 'message': 'Git установлен.' if code == 0 else 'Git не найден на сервере.'})
+    if code:
+        return {'checks': checks}
+    try:
+        current = status(conn, include_snapshot=False)
+    except RemoteError as exc:
+        checks.append({'ok': False, 'message': str(exc)})
+        return {'checks': checks}
+    if not current['connected']:
+        checks.append({'ok': False, 'message': 'В корне проекта ещё нет Git-репозитория.'})
+        return {'checks': checks}
+    author = author_identity(conn, settings)
+    checks.append({'ok': bool(author['name'] and author['email']), 'message': 'Автор: ' + author['name'] + ' <' + author['email'] + '> · ' + author['source']})
+    for part in ('', 'objects', 'refs'):
+        path = conn.text('git rev-parse --git-path ' + shlex.quote(part or '.')).strip()
+        code, _, _ = conn.run('test -w ' + shlex.quote(path))
+        checks.append({'ok': code == 0, 'message': ('Есть права записи: ' if code == 0 else 'Нет прав записи: ') + ('.git/' + part)})
+    lock = conn.text('git rev-parse --git-path index.lock').strip()
+    code, _, _ = conn.run('test -e ' + shlex.quote(lock))
+    checks.append({'ok': code != 0, 'message': 'Блокировки индекса нет.' if code else 'Обнаружен index.lock. Дождитесь завершения Git-процессов; проверяйте оставшуюся блокировку вручную.'})
+    code, out, _ = conn.run('git config --bool --get commit.gpgsign')
+    signing = code == 0 and out.strip() == b'true'
+    checks.append({'ok': not signing, 'message': 'Подпись коммитов включена: SSH-сеансу нужен доступный ключ GPG/SSH. Если подпись не нужна, настройте commit.gpgsign=false вручную для этого проекта.' if signing else 'Обязательная подпись коммитов не включена.'})
+    checks.append({'ok': None, 'message': 'Проверка прав не гарантирует запись при исчерпанной квоте. При ошибке 128 проверьте квоту в панели хостинга и сообщения Git. Диагностика не создаёт коммит и не изменяет файлы.'})
+    return {'checks': checks}
+
+
 def log_commits(conn, revision):
     raw = conn.text('git log -z -n 50 --format=%H%x00%h%x00%an%x00%ae%x00%aI%x00%s ' +
                     shlex.quote(revision) + ' --', max_output=400_000)
@@ -329,12 +360,12 @@ def commit(conn, current, files, message, settings, push=False):
         if item['path'] in files and item.get('old_path'):
             paths.append(item['old_path'])
     for start in range(0, len(paths), 100):
-        conn.text('git --literal-pathspecs add -A -- ' + ' '.join(shlex.quote(p) for p in paths[start:start + 100]))
+        conn.text('LC_ALL=C git --literal-pathspecs add -A -- ' + ' '.join(shlex.quote(p) for p in paths[start:start + 100]))
     # If a hook fails, do not undo the server index or overwrite the user's work.
     environment = ' '.join(key + '=' + shlex.quote(value) for key,value in (
         ('GIT_AUTHOR_NAME',identity['name']), ('GIT_AUTHOR_EMAIL',identity['email']),
         ('GIT_COMMITTER_NAME',identity['name']), ('GIT_COMMITTER_EMAIL',identity['email'])))
-    conn.text(environment + ' git -c user.name=' + shlex.quote(identity['name']) + ' -c user.email=' + shlex.quote(identity['email']) +
+    conn.text('LC_ALL=C ' + environment + ' git -c user.name=' + shlex.quote(identity['name']) + ' -c user.email=' + shlex.quote(identity['email']) +
               ' commit -m ' + shlex.quote(message), timeout=90)
     head = conn.text('git rev-parse --short HEAD').strip()
     result = {'commit': head, 'pushed': False, 'warning': '', 'author': identity}

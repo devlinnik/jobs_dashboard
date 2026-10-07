@@ -82,10 +82,22 @@ class Connection:
             # Git output may include a credential-bearing configured remote; do not return raw stderr.
             text = err.decode('utf-8', errors='replace').lower()
             reason = 'Проверьте Git/SSH-права и состояние проекта на сервере.'
-            if 'non-fast-forward' in text or 'rejected' in text:
+            if 'disk quota exceeded' in text or 'no space left on device' in text:
+                reason = 'Исчерпана квота хостинга или место на диске. Проверьте тариф в панели хостинга; освободите место перед повтором. Размер общего диска не показывает квоту аккаунта.'
+            elif 'detected dubious ownership' in text or 'unsafe repository' in text:
+                reason = 'Git не доверяет владельцу папки (safe.directory). Проверьте владельца и SSH-пользователя. Для доверенного проекта добавьте только его абсолютный путь в safe.directory через SSH; не используйте *. '
+            elif 'index.lock' in text and ('exists' in text or 'unable to create' in text):
+                reason = 'Git не может создать .git/index.lock: другая Git-операция, оставшаяся блокировка или нет прав записи. Проверьте диагностику. Блокировка автоматически не удаляется.'
+            elif any(s in text for s in ('author identity unknown', 'unable to auto-detect email', 'empty ident name', 'invalid author', 'empty ident email')):
+                reason = 'Git не смог определить автора. Заполните имя и email вместе в Git-профиле либо исправьте user.name/user.email на сервере.'
+            elif any(s in text for s in ('gpg failed', 'failed to write commit object', 'no secret key', 'cannot run gpg', 'could not sign')):
+                reason = 'Не удалось создать или подписать объект коммита. Проверьте квоту и права .git/objects, а также commit.gpgsign и ключ подписи на сервере. Изменения в индексе сохранены.'
+            elif 'read-only file system' in text or 'operation not permitted' in text:
+                reason = 'Файловая система или файлы Git недоступны для записи. Проверьте права и ограничения хостинга.'
+            elif 'non-fast-forward' in text or 'rejected' in text:
                 reason = 'Push отклонён: история веток разошлась или ветка защищена. Force push не выполняется.'
-            elif 'permission denied' in text or 'authentication failed' in text:
-                reason = 'Нет доступа. Проверьте SSH-ключ сервера и права записи в репозиторий.'
+            elif 'permission denied' in text or 'authentication failed' in text or 'insufficient permission' in text:
+                reason = 'Нет доступа. Проверьте SSH-пользователя, владельца и права записи .git, включая objects/refs; для сетевых операций — Git-профиль или SSH-ключ Git-хостинга.'
             elif 'host key verification failed' in text:
                 reason = 'На сервере не подтверждён ключ Git-хостинга. Проверьте known_hosts через доверенный канал.'
             elif 'could not resolve' in text:
@@ -96,6 +108,8 @@ class Connection:
                 reason = 'Папка проекта не найдена или недоступна. Выберите её через SSH-проводник.'
             elif 'not a git repository' in text:
                 reason = 'В выбранной папке нет Git-репозитория. Подключите его в разделе Git.'
+            if code == 128:
+                reason += ' Откройте «Git & файлы → Диагностика Git»; полный вывод Git и квоту также можно проверить через SSH/панель хостинга.'
             raise RemoteError('Команда сервера завершилась с ошибкой (код %s). %s' % (code, reason))
         return out.decode('utf-8', errors='replace')
 
@@ -149,12 +163,46 @@ class Connection:
             raise RemoteError('Не удалось прочитать каталог по SFTP. Проверьте, включён ли SFTP на сервере и есть ли права просмотра.') from exc
 
     def disk(self):
+        if self.project.get('hosting'):
+            return self.hosting_disk()
         output = self.text('LC_ALL=C df -Pk -- ' + shlex.quote(self.path))
         fields = output.strip().splitlines()[-1].split()
         if len(fields) < 6:
             raise RemoteError('Не удалось разобрать ответ df')
         total, free = int(fields[1]) * 1024, int(fields[3]) * 1024
-        return {'total': total, 'free': free, 'free_percent': round(free / total * 100, 1), 'source': 'SSH'}
+        return {'total': total, 'free': free, 'free_percent': round(free / total * 100, 1), 'source': 'SSH',
+                'kind': 'filesystem', 'note': 'Свободное место общей файловой системы; квота аккаунта хостинга не учитывается.'}
+
+    def hosting_disk(self):
+        root = self.project.get('hosting_path', '')
+        limit = self.project.get('hosting_limit_gb', 0)
+        unit = self.project.get('hosting_unit', 'GB')
+        if not root or not root.startswith('/') or root.rstrip('/') == '' or limit <= 0:
+            raise RemoteError('В SSH-профиле хостинга укажите лимит тарифа и корневую папку аккаунта.')
+        real_root = self.text('cd -- ' + shlex.quote(root) + ' && pwd -P', in_project=False).strip()
+        if real_root == '/':
+            raise RemoteError('Для хостинга выберите папку аккаунта, а не корень сервера /.')
+        if self.path:
+            real_project = self.check_directory()
+            if real_project != real_root and not real_project.startswith(real_root.rstrip('/') + '/'):
+                raise RemoteError('Проект находится вне папки аккаунта хостинга. Проверьте корневой путь в SSH-профиле.')
+        code, out, _ = self.run('LC_ALL=C du -sk -- ' + shlex.quote(real_root), in_project=False, timeout=90, max_output=4096)
+        if code:
+            raise RemoteError('Не удалось полностью измерить аккаунт хостинга: проверьте права чтения всех папок и наличие du. Частичный результат не используется.')
+        try:
+            used = int(out.decode().split()[0]) * 1024
+            if used < 0:
+                raise ValueError()
+        except (ValueError, IndexError) as exc:
+            raise RemoteError('Команда du вернула неверный размер аккаунта.') from exc
+        total = int(limit * (1024**3 if unit == 'GiB' else 1000**3))
+        if total <= 0:
+            raise RemoteError('Лимит тарифа должен быть больше одного байта.')
+        free = max(0, total - used)
+        return {'total': total, 'used': used, 'free': free, 'free_percent': round(free / total * 100, 1),
+                'kind': 'hosting_estimate', 'estimated': True, 'source': 'SSH · оценка тарифа',
+                'path': real_root, 'limit': limit, 'unit': unit, 'over_limit': max(0, used - total),
+                'note': 'Лимит тарифа минус размер всей папки аккаунта (du). Почта, базы данных и другие данные вне этой папки не учтены. Точная квота — в панели хостинга.'}
 
 
 @contextmanager
