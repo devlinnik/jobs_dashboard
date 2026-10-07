@@ -405,3 +405,67 @@ def test_repository_access_reports_safe_specific_errors(repo, monkeypatch, opera
     assert message in str(raised.value)
     assert 'secret-token' not in str(raised.value)
     assert git(work, 'remote', 'get-url', 'origin') == remote
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize('accessible', [True, False])
+def test_attach_selected_server_key_only_persists_after_success(repo, tmp_path, monkeypatch, accessible):
+    import shlex
+    work, conn = repo
+    key = tmp_path / "server key's name"
+    key.write_text('fixture: no private key contents are read')
+    old = 'https://github.com/owner/project.git'
+    new = 'git@github.com:owner/project.git'
+    git(work, 'remote', 'add', 'origin', old)
+    before = git(work, 'rev-parse', 'HEAD')
+    current = gitops.status(conn)
+    def transport(connection, arguments, remote):
+        command = shlex.split(connection.server_git_ssh_command)
+        assert command[command.index('-i') + 1] == str(key)
+        assert 'IdentitiesOnly=yes' in command
+        return (0 if accessible else 128), b'', b'Permission denied (publickey).'
+    monkeypatch.setattr(gitops, 'network', transport)
+    request = SimpleNamespace(remote=new, branch='main', snapshot=current['snapshot'], expected_remote=old,
+                              expected_git_profile_id='', replace_remote=True, confirm=True, server_ssh_key=str(key))
+    if accessible:
+        assert gitops.attach(conn, request)['ok']
+        assert git(work, 'remote', 'get-url', 'origin') == new
+        assert gitops.access_settings(conn)['server_ssh_key'] == str(key)
+    else:
+        with pytest.raises(RemoteError, match='Нет доступа'):
+            gitops.attach(conn, request)
+        assert git(work, 'remote', 'get-url', 'origin') == old
+        assert not gitops.access_settings(conn)['command_configured']
+    assert git(work, 'rev-parse', 'HEAD') == before
+    assert (work / 'index.php').read_text() == 'v1'
+
+
+@POSIX_ONLY
+def test_server_key_paths_missing_public_and_shell_characters(repo, tmp_path):
+    work, conn = repo
+    with pytest.raises(RemoteError, match='абсолютный путь'):
+        gitops.prepare_server_key(conn, 'relative/path')
+    with pytest.raises(RemoteError, match='не найден'):
+        gitops.prepare_server_key(conn, str(tmp_path / 'missing'))
+    public = tmp_path / 'key.pub'; public.write_text('ssh-ed25519 fixture')
+    with pytest.raises(RemoteError, match='без .pub'):
+        gitops.prepare_server_key(conn, str(public))
+    key = tmp_path / '$(touch marker); key'; key.write_text('fixture')
+    assert gitops.prepare_server_key(conn, str(key))
+    assert not (work / 'marker').exists()
+    with pytest.raises(RemoteError, match='абсолютный путь'):
+        gitops.prepare_server_key(conn, str(key) + '\ncommand')
+
+
+@POSIX_ONLY
+def test_access_settings_and_diagnostics_explain_https_without_exposing_commands(repo):
+    work, conn = repo
+    git(work, 'remote', 'add', 'origin', 'https://github.com/owner/project.git')
+    git(work, 'config', '--local', 'core.sshCommand', 'ssh -i /server/git-key -o ProxyCommand=secret-command')
+    access = gitops.access_settings(conn)
+    assert access['ssh_url'] == 'git@github.com:owner/project.git'
+    assert access['server_ssh_key'] == '/server/git-key'
+    report = gitops.diagnostics(conn, {})
+    messages = str(report)
+    assert 'HTTPS' in messages and 'SSH-ключ здесь не применяется' in messages
+    assert '/server/git-key' in messages and 'secret-command' not in messages

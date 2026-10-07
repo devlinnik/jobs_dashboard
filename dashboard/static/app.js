@@ -759,23 +759,36 @@ async function gitProfileAction(action, id) {
 $('#git-profile-list').onclick = event => { const button = event.target.closest('[data-git-profile-action]'); if (button) busy(button, () => gitProfileAction(button.dataset.gitProfileAction, button.dataset.profileId)); };
 $('#git-profile-test').onclick = event => busy(event.currentTarget, () => gitProfileAction('test', $('#git-profile-form').elements.id.value));
 
-function openGitConnect() {
+async function openGitConnect() {
   const p = getProject();
   gitConnectState = {id:p.id, profileId:p.git_profile_id || '', snapshot:gitData.snapshot, remote:gitData.remote || ''};
-  $('#git-connect-remote').value = /^https:\/\//.test(gitData.remote) ? gitData.remote : '';
+  $('#git-connect-remote').value = gitData.remote || '';
+  $('#git-server-key').value = ''; $('#git-server-key-field').hidden = Boolean(p.git_profile_id); $('#git-use-ssh').hidden = true;
+  $('#git-connect-auth-hint').textContent = p.git_profile_id ? 'Git-профиль использует HTTPS и токен.' : 'HTTPS использует токен; SSH использует ключ на сервере. Пароль аккаунта GitHub для Git не подходит.';
   $('#git-connect-branch').value = p.git_branch || (gitData.branch !== '(detached HEAD)' && gitData.branch) || 'main';
   $('#git-connect-info').textContent = `${p.ssh_path} · ${p.git_profile_name || 'Авторизация на сервере'}${gitData.remote ? '\nТекущий origin: ' + gitData.remote : '\norigin не настроен'}`;
   $('#git-connect-error').textContent = ''; $('#git-repository-picker').disabled = !p.git_profile_id;
+  $('#git-connect-info').textContent += '\nВерсия приложения: ' + $('#app-version').textContent;
   $('#git-connect-dialog').showModal();
+  try {
+    const access = await api(`/projects/${p.id}/git/access-settings`);
+    if (!$('#git-connect-dialog').open || gitConnectState.id !== p.id) return;
+    if (!$('#git-server-key').value) $('#git-server-key').value = access.server_ssh_key || '';
+    $('#git-server-key-field').hidden = Boolean(p.git_profile_id);
+    $('#git-use-ssh').hidden = Boolean(p.git_profile_id) || !access.ssh_url;
+    $('#git-use-ssh').onclick = () => { $('#git-connect-remote').value = access.ssh_url; $('#git-use-ssh').hidden = true; };
+    if (access.environment_override) $('#git-connect-auth-hint').textContent += ' На сервере задан GIT_SSH_COMMAND; изменить выбранный ключ нужно в настройках сервера.';
+  } catch (error) { $('#git-connect-error').textContent = error.message; }
 }
 $('#git-connect-form').onsubmit = event => {
   event.preventDefault(); busy($('button[type=submit]', event.currentTarget), async () => {
     $('#git-connect-error').textContent = '';
     const state = gitConnectState, remote = $('#git-connect-remote').value.trim(), branch = $('#git-connect-branch').value.trim();
     const replace = Boolean(state.remote && state.remote !== remote);
-    if (!await confirmAction(replace ? 'Заменить origin проекта?' : 'Подключить репозиторий?', `${remote}\n${replace ? 'Текущий origin: ' + state.remote + '\nАдрес origin и его отдельный pushurl будут заменены.' : 'В выбранной серверной папке будет создан Git, если его ещё нет, и настроен origin.'}\nФайлы и история сохраняются. Загрузка файлов и отправка коммитов выполняются отдельно.`)) return;
+    const serverKey = $('#git-server-key-field').hidden ? '' : $('#git-server-key').value.trim();
+    if (!await confirmAction(replace ? 'Заменить origin проекта?' : 'Подключить репозиторий?', `${remote}\n${serverKey ? 'SSH-ключ на сервере: ' + serverKey + '\nБудет сохранён в настройках Git этого проекта после успешной проверки.\n' : ''}${replace ? 'Текущий origin: ' + state.remote + '\nАдрес origin и его отдельный pushurl будут заменены.' : 'В выбранной серверной папке будет создан Git, если его ещё нет, и настроен origin.'}\nФайлы и история сохраняются. Загрузка файлов и отправка коммитов выполняются отдельно.`)) return;
     try {
-      const result = await api(`/projects/${state.id}/git/attach`, {method:'POST',body:{remote,branch,snapshot:state.snapshot,expected_remote:state.remote,expected_git_profile_id:state.profileId,replace_remote:replace,confirm:true}});
+      const result = await api(`/projects/${state.id}/git/attach`, {method:'POST',body:{remote,branch,server_ssh_key:serverKey,snapshot:state.snapshot,expected_remote:state.remote,expected_git_profile_id:state.profileId,replace_remote:replace,confirm:true}});
       $('#git-connect-dialog').close(); toast(result.message); await loadProjects(); if (selectedId === state.id && activeTab === 'git') await loadGit();
     } catch (error) { $('#git-connect-error').textContent = error.message; }
   });

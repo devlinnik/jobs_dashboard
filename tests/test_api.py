@@ -17,10 +17,10 @@ def unlock(client, pin=''):
 def test_release_identity_and_uncached_frontend(tmp_path):
     with client_for(tmp_path) as client:
         assert client.get('/api/app-info').status_code == 401
-        assert client.get('/api/session').json()['version'] == '1.10.1'
+        assert client.get('/api/session').json()['version'] == '1.10.2'
         unlock(client)
         info = client.get('/api/app-info').json()
-        assert info['version'] == '1.10.1' and info['executable']
+        assert info['version'] == '1.10.2' and info['executable']
         for path in ('/', '/static/app.js', '/static/styles.css'):
             response = client.get(path)
             assert response.status_code == 200

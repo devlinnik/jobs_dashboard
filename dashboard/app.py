@@ -451,6 +451,10 @@ def create_app(directory=None, start_monitor=True):
     async def check_git_repository(pid: str):
         return await operation(pid, gitops.check_remote)
 
+    @app.get('/api/projects/{pid}/git/access-settings', dependencies=auth)
+    async def git_access_settings(pid: str):
+        return await operation(pid, gitops.access_settings)
+
     @app.post('/api/projects/{pid}/git/attach', dependencies=auth)
     async def attach_git_repository(pid: str, body: GitAttachInput):
         result = await operation(pid, gitops.attach, body)

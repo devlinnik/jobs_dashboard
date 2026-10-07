@@ -55,6 +55,9 @@ def network(conn, arguments, remote):
              'if test -z "$devlin_git_ssh"; then '
              'devlin_git_ssh=$(git config --get core.sshCommand) || devlin_git_ssh=ssh; fi; '
              'if test -z "$devlin_git_ssh"; then devlin_git_ssh=ssh; fi; ')
+    override = getattr(conn, 'server_git_ssh_command', '')
+    if override:
+        setup = 'devlin_git_ssh=' + shlex.quote(override) + '; '
     common = ('GIT_TERMINAL_PROMPT=0 '
               'GIT_SSH_COMMAND="$devlin_git_ssh -o BatchMode=yes -o StrictHostKeyChecking=yes" ')
 
@@ -91,6 +94,52 @@ def network(conn, arguments, remote):
     return conn.run(script, timeout=90, input_data=(authorization + '\n').encode())
 
 
+def access_settings(conn):
+    """Expose identity paths and transport, never arbitrary commands or key contents."""
+    code, out, _ = conn.run('if test -n "${GIT_SSH_COMMAND:-}"; then printf "%s" "$GIT_SSH_COMMAND"; else git config --get core.sshCommand; fi')
+    key = ''
+    if code == 0:
+        try:
+            args = shlex.split(out.decode('utf-8', errors='replace'))
+            for index, arg in enumerate(args):
+                if arg == '-i' and index + 1 < len(args):
+                    key = args[index + 1]
+                    break
+                if arg.startswith('IdentityFile='):
+                    key = arg.split('=', 1)[1]
+                    break
+        except ValueError:
+            pass
+    _, raw, _ = conn.run('git config --get remote.origin.url')
+    remote = raw.decode('utf-8', errors='replace').strip()
+    ssh_url = ''
+    try:
+        parsed = urlsplit(remote)
+    except ValueError:
+        parsed = None
+    if parsed and parsed.scheme == 'https' and parsed.hostname in ('github.com', 'gitlab.com') and not parsed.username and not parsed.password and re.fullmatch(r'/[a-zA-Z0-9_./-]+', parsed.path):
+        ssh_url = 'git@' + parsed.hostname + ':' + parsed.path.lstrip('/')
+    return {'server_ssh_key': key, 'ssh_url': ssh_url,
+            'command_configured': code == 0 and bool(out.strip()),
+            'environment_override': conn.text('test -z "${GIT_SSH_COMMAND:-}" && printf no || printf yes').strip() == 'yes'}
+
+
+def prepare_server_key(conn, value):
+    if any(c in value for c in '\x00\r\n') or not (value.startswith('/') or value.startswith('~/')):
+        raise RemoteError('Укажите абсолютный путь к SSH-ключу на сервере или путь ~/.ssh/имя_ключа.')
+    if value.startswith('~/'):
+        home = conn.text('printf "%s" "$HOME"').strip()
+        if not home.startswith('/'):
+            raise RemoteError('Не удалось определить домашнюю папку SSH-пользователя.')
+        value = home.rstrip('/') + value[1:]
+    code, _, _ = conn.run('test -f ' + shlex.quote(value) + ' && test -r ' + shlex.quote(value))
+    if code:
+        raise RemoteError('SSH-ключ не найден или недоступен для чтения на сервере. Создайте ключ в консоли хостинга; нужен файл без .pub.')
+    if value.endswith('.pub'):
+        raise RemoteError('Укажите приватный SSH-ключ без .pub. Его содержимое не передаётся на ПК.')
+    return 'ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -i ' + shlex.quote(value) + ' -o IdentitiesOnly=yes'
+
+
 def check_remote(conn):
     current = status(conn)
     if not current['connected'] or not current['remote']:
@@ -118,6 +167,15 @@ def attach(conn, request):
     if not current['connected'] and configured and configured != request.branch:
         raise RemoteError('Начальная ветка должна совпадать с выбранной веткой проекта')
     profile = getattr(conn, 'git_profile', None)
+    key = getattr(request, 'server_ssh_key', '').strip()
+    command = ''
+    if key:
+        if profile or request.remote.startswith('https://'):
+            raise RemoteError('Серверный SSH-ключ используется с SSH URL и без Git-профиля с HTTPS-токеном.')
+        if access_settings(conn)['environment_override']:
+            raise RemoteError('На сервере задан GIT_SSH_COMMAND: он перекрывает настройки проекта. Измените эту переменную на сервере или уберите её перед выбором ключа.')
+        command = prepare_server_key(conn, key)
+        conn.server_git_ssh_command = command
     if profile:
         Provider(profile, conn.git_token).repository(request.remote)
     code, _, error = network(conn, 'ls-remote ' + shlex.quote(request.remote), request.remote)
@@ -135,6 +193,8 @@ def attach(conn, request):
     elif current['remote'] != request.remote:
         conn.text('git remote set-url origin ' + shlex.quote(request.remote))
         conn.run('git config --unset-all remote.origin.pushurl')
+    if command:
+        conn.text('git config --local core.sshCommand ' + shlex.quote(command))
     return {'ok': True, 'message': 'Репозиторий подключён. Файлы и коммиты не изменены. Для выгрузки выберите файлы и создайте коммит.'}
 
 
@@ -274,6 +334,12 @@ def diagnostics(conn, settings):
     if not current['connected']:
         checks.append({'ok': False, 'message': 'В корне проекта ещё нет Git-репозитория.'})
         return {'checks': checks}
+    access = access_settings(conn)
+    if current['remote'].startswith('https://') and not getattr(conn, 'git_profile', None):
+        checks.append({'ok': False, 'message': 'origin использует HTTPS: серверный SSH-ключ здесь не применяется. GitHub не принимает пароль аккаунта для Git. Выберите SSH URL через «Настроить подключение репозитория» или назначьте Git-профиль с токеном.'})
+    elif current['remote']:
+        checks.append({'ok': None, 'message': 'Транспорт Git: ' + ('HTTPS с Git-профилем.' if current['remote'].startswith('https://') else 'SSH с сервера.')})
+    checks.append({'ok': None, 'message': ('Серверный SSH-ключ: ' + access['server_ssh_key'] if access['server_ssh_key'] else 'Серверный SSH-ключ явно не указан: используются настройки ~/.ssh/config, SSH-агент и стандартные ключи.') + (' Переменная GIT_SSH_COMMAND перекрывает core.sshCommand.' if access['environment_override'] else '')})
     try:
         snapshot(conn, json.dumps(current['files'], sort_keys=True), current['files'], current['head'])
         checks.append({'ok': True, 'message': 'Предварительная проверка содержимого изменённых файлов прошла. Символические ссылки проверяются без чтения их целей.'})

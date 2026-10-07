@@ -220,6 +220,7 @@ class InitInput(SyncInput):
 
 
 class GitAttachInput(BaseModel):
+    server_ssh_key: str = Field(default='', max_length=1024)
     remote: str = Field(min_length=1, max_length=2048)
     branch: str = Field(default='main', min_length=1, max_length=100)
     snapshot: str
