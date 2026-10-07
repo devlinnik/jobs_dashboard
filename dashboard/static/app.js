@@ -75,13 +75,36 @@ new MutationObserver(records => {
   }
   const host = notificationDialogs.at(-1) || document.body;
   if ($('#toast-region').parentElement !== host) host.append($('#toast-region'));
+  if ($('#operation-region').parentElement !== host) host.prepend($('#operation-region'));
 }).observe(document.body, {subtree:true, attributes:true, attributeFilter:['open']});
+const activeOperations = new Map();
+let operationSequence = 0;
+function renderOperations() {
+  const region = $('#operation-region'); region.hidden = activeOperations.size === 0;
+  region.replaceChildren();
+  for (const item of activeOperations.values()) {
+    const row = document.createElement('div'); row.className = 'operation-status';
+    const spinner = document.createElement('span'); spinner.className = 'operation-spinner'; spinner.setAttribute('aria-hidden', 'true');
+    const text = document.createElement('span'); text.textContent = `${item.label} · ${Math.floor((Date.now() - item.started) / 1000)} с`;
+    row.append(spinner, text); region.append(row);
+  }
+}
+setInterval(() => { if (activeOperations.size) renderOperations(); }, 1000);
 async function busy(button, fn) {
   if (button?.disabled) return;
-  if (button) button.disabled = true;
+  const id = ++operationSequence;
+  const labels = {commit:'Подготовка и создание коммита',push:'Проверка и отправка коммитов',pull:'Загрузка изменений из Git',unstage:'Отмена подготовки файлов',diagnostics:'Диагностика Git',check:'Проверка репозитория',refresh:'Обновление списка файлов'};
+  const action = button?.dataset.gitAction;
+  const label = labels[action] || (button?.textContent.trim() ? button.textContent.trim() + ' — выполняется' : 'Операция выполняется');
+  activeOperations.set(id, {label, started:Date.now()}); renderOperations();
+  if (button) { button.disabled = true; button.setAttribute('aria-busy', 'true'); }
   try { return await fn(); } catch (error) { toast(error.message, true); }
-  finally { if (button) { button.disabled = false; button.removeAttribute('aria-busy'); } }
+  finally {
+    activeOperations.delete(id); renderOperations();
+    if (button) { button.disabled = false; button.removeAttribute('aria-busy'); }
+  }
 }
+
 function confirmAction(title, description, extra = '') {
   const dialog = $('#confirm-dialog');
   if (dialog.open) dialog.close();

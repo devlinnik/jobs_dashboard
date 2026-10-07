@@ -48,6 +48,18 @@ def command_failure(code, err, context=''):
     reason = 'Проверьте Git/SSH-права и состояние проекта на сервере.'
     if 'disk quota exceeded' in text or 'no space left on device' in text:
         reason = 'Исчерпана квота хостинга или место на диске. Проверьте тариф в панели хостинга; освободите место перед повтором. Размер общего диска не показывает квоту аккаунта.'
+    elif any(value in text for value in ('unable to create thread', 'cannot create async thread', 'pthread_create', 'resource temporarily unavailable', 'unable to fork', 'cannot fork')):
+        reason = 'Хостинг ограничил создание потоков или процессов. В SSH-профиле включите режим хостинга: добавление файлов и коммит будут выполняться с одним потоком Git. Проверьте лимиты процессов аккаунта в панели хостинга.'
+    elif any(value in text for value in ('cannot allocate memory', 'out of memory', 'unable to mmap', 'malloc failed')):
+        reason = 'Git не хватило памяти в пределах лимитов аккаунта хостинга. Закройте лишние процессы или увеличьте лимит памяти; попробуйте добавлять файлы небольшими группами.'
+    elif 'too many open files' in text:
+        reason = 'Достигнут лимит открытых файлов аккаунта хостинга. Проверьте лимиты и работающие процессы в панели хостинга.'
+    elif any(value in text for value in ('index file corrupt', 'index file smaller than expected', 'invalid index', 'bad index file', 'invalid object', 'bad object')):
+        reason = 'Git обнаружил повреждённый индекс или объект. Не удаляйте .git: сохраните резервную копию и проверьте репозиторий через git fsck на сервере.'
+    elif 'beyond a symbolic link' in text:
+        reason = 'Выбранный путь проходит через символическую ссылку. Git не добавляет файлы через такой путь; выберите саму ссылку или реальную папку проекта.'
+    elif 'insufficient permission for adding an object' in text or 'unable to write new index file' in text or 'unable to index file' in text or 'failed to insert into database' in text or 'unable to create temporary file' in text:
+        reason = 'Git не смог записать файл в индекс или .git/objects. Проверьте владельца и права .git/objects и .git/index, дисковую квоту аккаунта и лимит количества файлов (inode). Подготовленные файлы могут остаться в индексе.'
     elif 'detected dubious ownership' in text or 'unsafe repository' in text:
         reason = 'Git не доверяет владельцу папки (safe.directory). Проверьте владельца и SSH-пользователя. Для доверенного проекта добавьте только его абсолютный путь в safe.directory через SSH; не используйте *. '
     elif 'index.lock' in text and ('exists' in text or 'unable to create' in text):
@@ -118,7 +130,9 @@ class Connection:
     def text(self, command, *, context='', **kwargs):
         code, out, err = self.run(command, **kwargs)
         if code:
-            raise command_failure(code, err, context)
+            # Some hosting wrappers merge stderr into stdout. Classify both,
+            # still return only fixed safe messages rather than raw server output.
+            raise command_failure(code, err + b'\n' + out, context)
         return out.decode('utf-8', errors='replace')
 
     def check_directory(self):

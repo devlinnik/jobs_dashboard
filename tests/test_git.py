@@ -547,3 +547,49 @@ def test_unstage_refuses_merge_conflicts(repo):
         gitops.unstage(conn, request)
     assert git(work, 'ls-files', '--unmerged')
     assert (work / 'index.php').read_text() == 'v1'
+
+
+@POSIX_ONLY
+def test_hosting_commit_limits_threads_and_uses_small_batches(repo):
+    work, conn = repo
+    conn.project = {'hosting': True}
+    paths = []
+    for number in range(25):
+        name = f'file-{number}.txt'; (work / name).write_text(str(number)); paths.append(name)
+    state = gitops.status(conn)
+    original = conn.run
+    commands = []
+    def record(command, **kwargs):
+        commands.append(command)
+        return original(command, **kwargs)
+    conn.run = record
+    result = gitops.sync(conn, SimpleNamespace(snapshot=state['snapshot'], files=paths, message='Hosting commit', push=False), {'git_name':'Test','git_email':'test@example.com'})
+    assert result['commit']
+    adds = [c for c in commands if ' add -A -- ' in c]
+    assert len(adds) == 2
+    assert all('core.preloadIndex=false' in c and 'index.threads=1' in c and 'pack.threads=1' in c for c in adds)
+    assert any(' commit -m ' in c and 'index.threads=1' in c for c in commands)
+    assert not subprocess.run(['git','-C',str(work),'config','--local','--get','index.threads'],capture_output=True).stdout
+
+
+@pytest.mark.parametrize(('stderr','expected'), [
+    ('fatal: unable to create thread: Resource temporarily unavailable', 'потоков или процессов'),
+    ('fatal: mmap failed: Cannot allocate memory', 'не хватило памяти'),
+    ('fatal: too many open files', 'лимит открытых файлов'),
+    ('error: insufficient permission for adding an object to repository database .git/objects', 'индекс или .git/objects'),
+    ('fatal: index file smaller than expected', 'повреждённый индекс'),
+])
+def test_git_failure_distinguishes_hosting_limits_without_leaking_output(stderr, expected):
+    from dashboard.remote import command_failure
+    error = command_failure(128, (stderr + '\nhttps://secret-token@private.test/key').encode(), 'Добавление файлов в индекс Git')
+    assert expected in str(error)
+    assert 'secret-token' not in str(error)
+
+
+def test_hosting_merged_stdout_error_is_classified_without_exposing_content(repo):
+    _, conn = repo
+    conn.run = lambda *args, **kwargs: (128, b'fatal: unable to create thread: Resource temporarily unavailable\nprivate-output', b'')
+    with pytest.raises(RemoteError) as raised:
+        conn.text('git add', context='Добавление файлов в индекс Git')
+    assert 'потоков или процессов' in str(raised.value)
+    assert 'private-output' not in str(raised.value)

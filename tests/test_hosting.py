@@ -82,7 +82,7 @@ def test_partial_usage_never_returns_fake_free_space():
     (b'fatal: detected dubious ownership SECRET_TOKEN','safe.directory'),
     (b'Author identity unknown SECRET_TOKEN','автора'),
     (b'gpg failed to sign SECRET_TOKEN','подписать'),
-    (b'insufficient permission for adding an object SECRET_TOKEN','objects/refs')])
+    (b'insufficient permission for adding an object SECRET_TOKEN','.git/objects')])
 def test_git_128_diagnostics_hide_raw_output(stderr, hint):
     class Failed(Connection):
         def run(self, *args, **kwargs): return 128, b'', stderr

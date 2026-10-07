@@ -459,15 +459,18 @@ def commit(conn, current, files, message, settings, push=False):
     for item in current['files']:
         if item['path'] in files and item.get('old_path'):
             paths.append(item['old_path'])
-    for start in range(0, len(paths), 100):
-        batch = paths[start:start + 100]
-        conn.text('LC_ALL=C git --literal-pathspecs add -A -- ' + ' '.join(shlex.quote(p) for p in batch),
+    hosting = getattr(conn, 'project', {}).get('hosting', False)
+    local_git = 'git -c core.preloadIndex=false -c index.threads=1 -c pack.threads=1' if hosting else 'git'
+    batch_size = 20 if hosting else 100
+    for start in range(0, len(paths), batch_size):
+        batch = paths[start:start + batch_size]
+        conn.text('LC_ALL=C ' + local_git + ' --literal-pathspecs add -A -- ' + ' '.join(shlex.quote(p) for p in batch),
                   context='Добавление файлов в индекс Git: ' + ', '.join(batch[:5]) + (' …' if len(batch) > 5 else ''))
     # If a hook fails, do not undo the server index or overwrite the user's work.
     environment = ' '.join(key + '=' + shlex.quote(value) for key,value in (
         ('GIT_AUTHOR_NAME',identity['name']), ('GIT_AUTHOR_EMAIL',identity['email']),
         ('GIT_COMMITTER_NAME',identity['name']), ('GIT_COMMITTER_EMAIL',identity['email'])))
-    conn.text('LC_ALL=C ' + environment + ' git -c user.name=' + shlex.quote(identity['name']) + ' -c user.email=' + shlex.quote(identity['email']) +
+    conn.text('LC_ALL=C ' + environment + ' ' + local_git + ' -c user.name=' + shlex.quote(identity['name']) + ' -c user.email=' + shlex.quote(identity['email']) +
               ' commit -m ' + shlex.quote(message), timeout=90, context='Создание коммита из подготовленных файлов')
     head = conn.text('git rev-parse --short HEAD').strip()
     result = {'commit': head, 'pushed': False, 'warning': '', 'author': identity}
