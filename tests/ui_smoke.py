@@ -78,7 +78,7 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            expect(page.locator('#app-version')).to_have_text('v1.10.5')
+            expect(page.locator('#app-version')).to_have_text('v1.10.6')
             assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == 'light'
             assert page.evaluate("parseFloat(getComputedStyle(document.body).fontSize)") >= 16
             page.locator('[data-nav=ssh-profiles]').click()
@@ -231,7 +231,7 @@ def main():
             page.locator('[data-git-action=check]').click()
             expect(page.get_by_text('Репозиторий не подключён. Выберите его через кнопку «Подключить репозиторий».',exact=True)).to_be_visible()
             page.locator('[data-git-action=attach]').click()
-            expect(page.locator('#git-connect-info')).to_contain_text('Версия приложения: v1.10.5')
+            expect(page.locator('#git-connect-info')).to_contain_text('Версия приложения: v1.10.6')
             expect(page.locator('#git-server-key-field')).not_to_be_visible()
             expect(page.locator('#git-connect-auth-hint')).to_contain_text('HTTPS и токен')
             page.locator('#git-repository-picker').click()
@@ -253,7 +253,8 @@ def main():
             page.locator('[data-git-action=unstage]').click()
             expect(page.locator('#operation-region')).to_be_visible()
             expect(page.locator('#operation-region')).to_contain_text('Отмена подготовки файлов')
-            expect(page.locator('#confirm-dialog > #operation-region')).to_be_attached()
+            expect(page.locator('#operation-region')).to_have_attribute('popover', 'manual')
+            assert page.locator('#operation-region').evaluate("node => node.matches(':popover-open')")
             assert page.locator('#operation-region').evaluate('''node => {
                 const previous = node.style.pointerEvents; node.style.pointerEvents = 'auto';
                 const r = node.getBoundingClientRect(); const target = document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);

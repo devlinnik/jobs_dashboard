@@ -47,6 +47,7 @@ def validate_branch(branch):
 def network(conn, arguments, remote):
     """Supply credentials through SSH stdin and process environment, never URL/argv/disk."""
     validate_remote(remote)
+    getattr(conn, 'report_progress', lambda *args: None)('Отправка коммитов' if arguments.startswith('push ') else 'Проверка удалённого репозитория', 0, 0)
     profile = getattr(conn, 'git_profile', None)
     # The server may select a non-default key using core.sshCommand. A fixed
     # GIT_SSH_COMMAND overrides that setting and silently loses the identity.
@@ -461,11 +462,15 @@ def commit(conn, current, files, message, settings, push=False):
             paths.append(item['old_path'])
     hosting = getattr(conn, 'project', {}).get('hosting', False)
     local_git = 'git -c core.preloadIndex=false -c index.threads=1 -c pack.threads=1' if hosting else 'git'
-    batch_size = 20 if hosting else 100
-    for start in range(0, len(paths), batch_size):
-        batch = paths[start:start + batch_size]
-        conn.text('LC_ALL=C ' + local_git + ' --literal-pathspecs add -A -- ' + ' '.join(shlex.quote(p) for p in batch),
-                  context='Добавление файлов в индекс Git: ' + ', '.join(batch[:5]) + (' …' if len(batch) > 5 else ''))
+    report = getattr(conn, 'report_progress', lambda *args: None)
+    report('Добавление файлов в индекс', 0, len(paths))
+    for number, path in enumerate(paths, 1):
+        # One literal path per command: no large argument lists, and a failure
+        # names exactly the file that failed rather than the first batch entries.
+        conn.text('LC_ALL=C ' + local_git + ' --literal-pathspecs add -A -- ' + shlex.quote(path),
+                  context='Добавление файла в индекс Git «' + path + '»')
+        report('Добавление файлов в индекс', number, len(paths))
+    report('Создание коммита', len(paths), len(paths))
     # If a hook fails, do not undo the server index or overwrite the user's work.
     environment = ' '.join(key + '=' + shlex.quote(value) for key,value in (
         ('GIT_AUTHOR_NAME',identity['name']), ('GIT_AUTHOR_EMAIL',identity['email']),
@@ -512,6 +517,7 @@ def unstage(conn, request):
 
 
 def sync(conn, request, settings):
+    getattr(conn, 'report_progress', lambda *args: None)('Проверка состояния файлов', 0, 0)
     current = status(conn)
     if not current['connected']:
         raise RemoteError('Сначала подключите репозиторий')

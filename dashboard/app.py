@@ -284,13 +284,46 @@ def create_app(directory=None, start_monitor=True):
             store.event(pid, 'info', 'Подтверждён отпечаток SSH-сервера')
         return {'ok': True}
 
-    async def operation(pid, fn, *args, require_project=True):
-        async with locks.setdefault(pid, asyncio.Lock()):
-            project = store.resolve_project(store.project(pid))
-            def execute():
-                with connect(store, project, require_project=require_project) as conn:
-                    return fn(conn, *args)
-            return await asyncio.to_thread(execute)
+    git_progress = {}
+
+    async def operation(pid, fn, *args, require_project=True, progress_id=''):
+        record = None
+        if progress_id:
+            try:
+                progress_id = str(uuid.UUID(progress_id))
+            except ValueError:
+                raise HTTPException(422, 'Некорректный идентификатор операции')
+            for key, value in list(git_progress.items()):
+                if value.get('done') and time.monotonic() - value['updated'] > 300:
+                    git_progress.pop(key, None)
+            if progress_id in git_progress:
+                raise HTTPException(409, 'Идентификатор операции уже использован')
+            record = {'pid': pid, 'stage': 'Ожидание выполнения', 'completed': 0, 'total': 0, 'done': False, 'updated': time.monotonic()}
+            git_progress[progress_id] = record
+        try:
+            async with locks.setdefault(pid, asyncio.Lock()):
+                project = store.resolve_project(store.project(pid))
+                def execute():
+                    if record is not None:
+                        record.update(stage='Подключение к серверу', updated=time.monotonic())
+                    with connect(store, project, require_project=require_project) as conn:
+                        if record is not None:
+                            def report(stage, completed=0, total=0):
+                                record.update(stage=stage, completed=completed, total=total, updated=time.monotonic())
+                            conn.report_progress = report
+                        return fn(conn, *args)
+                return await asyncio.to_thread(execute)
+        finally:
+            if record is not None:
+                record.update(done=True, updated=time.monotonic())
+
+    @app.get('/api/projects/{pid}/git/progress', dependencies=auth)
+    async def read_git_progress(pid: str, operation_id: str):
+        store.project(pid)
+        record = git_progress.get(operation_id)
+        if not record or record['pid'] != pid:
+            raise HTTPException(404, 'Операция ещё не началась или завершена')
+        return {key: record[key] for key in ('stage', 'completed', 'total', 'done')}
 
     @app.post('/api/projects/{pid}/ssh/test', dependencies=auth)
     async def test_ssh(pid: str):
@@ -494,10 +527,10 @@ def create_app(directory=None, start_monitor=True):
         return await operation(pid, gitops.fetch_commits, store.settings())
 
     @app.post('/api/projects/{pid}/git/push', dependencies=auth)
-    async def push_git_commits(pid: str, body: GitPushInput):
+    async def push_git_commits(pid: str, body: GitPushInput, request: Request):
         if not body.confirm:
             raise HTTPException(400, 'Нужно подтвердить отправку коммитов')
-        result = await operation(pid, gitops.push, body, store.settings())
+        result = await operation(pid, gitops.push, body, store.settings(), progress_id=request.headers.get('X-Devlin-Operation', ''))
         store.event(pid, 'success', result['message'])
         previous = store.state(pid)
         previous.pop('pending_push', None)
@@ -512,8 +545,8 @@ def create_app(directory=None, start_monitor=True):
         return result
 
     @app.post('/api/projects/{pid}/git/sync', dependencies=auth)
-    async def git_sync(pid: str, body: SyncInput):
-        result = await operation(pid, gitops.sync, body, store.settings())
+    async def git_sync(pid: str, body: SyncInput, request: Request):
+        result = await operation(pid, gitops.sync, body, store.settings(), progress_id=request.headers.get('X-Devlin-Operation', ''))
         store.event(pid, 'warning' if result['warning'] else 'success', 'Коммит ' + result['commit'] + (' отправлен в origin' if result['pushed'] else ' создан на сервере') + '. ' + result['warning'])
         previous = store.state(pid)
         if result['warning']:
@@ -525,8 +558,8 @@ def create_app(directory=None, start_monitor=True):
         return result
 
     @app.post('/api/projects/{pid}/git/init', dependencies=auth)
-    async def git_init(pid: str, body: InitInput):
-        result = await operation(pid, gitops.initialize, body, store.settings())
+    async def git_init(pid: str, body: InitInput, request: Request):
+        result = await operation(pid, gitops.initialize, body, store.settings(), progress_id=request.headers.get('X-Devlin-Operation', ''))
         store.event(pid, 'warning' if result['warning'] else 'success', 'Репозиторий подключён. Коммит ' + result['commit'] + '. ' + result['warning'])
         previous = store.state(pid)
         if result['warning']:

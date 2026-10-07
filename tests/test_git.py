@@ -135,7 +135,7 @@ def test_snapshot_does_not_run_clean_filters_but_staging_reports_failure(tmp_pat
     conn = LocalConnection(tmp_path)
     state = gitops.status(conn)
     assert state['snapshot']  # Raw preview must not execute the filter.
-    with pytest.raises(RemoteError,match='Добавление файлов в индекс Git: index.php') as error:
+    with pytest.raises(RemoteError,match='Добавление файла в индекс Git «index.php»') as error:
         gitops.sync(conn,SimpleNamespace(snapshot=state['snapshot'],files=['index.php'],message='Commit',push=False),
                     {'git_name':'Desk','git_email':'desk@example.com'})
     assert 'Git-фильтр' in str(error.value) and 'SECRET_TOKEN' not in str(error.value)
@@ -550,7 +550,7 @@ def test_unstage_refuses_merge_conflicts(repo):
 
 
 @POSIX_ONLY
-def test_hosting_commit_limits_threads_and_uses_small_batches(repo):
+def test_hosting_commit_limits_threads_and_adds_each_file(repo):
     work, conn = repo
     conn.project = {'hosting': True}
     paths = []
@@ -566,7 +566,7 @@ def test_hosting_commit_limits_threads_and_uses_small_batches(repo):
     result = gitops.sync(conn, SimpleNamespace(snapshot=state['snapshot'], files=paths, message='Hosting commit', push=False), {'git_name':'Test','git_email':'test@example.com'})
     assert result['commit']
     adds = [c for c in commands if ' add -A -- ' in c]
-    assert len(adds) == 2
+    assert len(adds) == 25
     assert all('core.preloadIndex=false' in c and 'index.threads=1' in c and 'pack.threads=1' in c for c in adds)
     assert any(' commit -m ' in c and 'index.threads=1' in c for c in commands)
     assert not subprocess.run(['git','-C',str(work),'config','--local','--get','index.threads'],capture_output=True).stdout
@@ -593,3 +593,35 @@ def test_hosting_merged_stdout_error_is_classified_without_exposing_content(repo
         conn.text('git add', context='Добавление файлов в индекс Git')
     assert 'потоков или процессов' in str(raised.value)
     assert 'private-output' not in str(raised.value)
+
+
+@POSIX_ONLY
+def test_all_eighty_files_create_one_commit_and_report_actual_progress(repo):
+    work, conn = repo
+    paths = [f'file {number}.txt' for number in range(80)]
+    for path in paths: (work / path).write_text(path)
+    current = gitops.status(conn)
+    progress = []
+    conn.report_progress = lambda *values: progress.append(values)
+    before = git(work, 'rev-list', '--count', 'HEAD')
+    gitops.sync(conn, SimpleNamespace(snapshot=current['snapshot'], files=paths, message='All 80', push=False), {'git_name':'Test','git_email':'test@example.com'})
+    assert int(git(work, 'rev-list', '--count', 'HEAD')) == int(before) + 1
+    assert all(git(work, 'show', 'HEAD:' + path) == path for path in paths)
+    assert [p[1] for p in progress if p[0] == 'Добавление файлов в индекс'] == list(range(81))
+    assert progress[-1][0] == 'Создание коммита'
+
+
+@POSIX_ONLY
+def test_failed_file_is_identified_after_successful_files(repo):
+    work, conn = repo
+    (work / '.gitattributes').write_text('bad.txt filter=broken\n')
+    for path in ('good.txt', 'bad.txt'): (work / path).write_text('content')
+    git(work, 'config', 'filter.broken.clean', 'exit 128')
+    git(work, 'config', 'filter.broken.required', 'true')
+    current = gitops.status(conn)
+    before = git(work, 'rev-parse', 'HEAD')
+    with pytest.raises(RemoteError, match='Добавление файла в индекс Git «bad.txt»'):
+        gitops.sync(conn, SimpleNamespace(snapshot=current['snapshot'], files=['good.txt','bad.txt'], message='Fail', push=False), {'git_name':'Test','git_email':'test@example.com'})
+    assert git(work, 'rev-parse', 'HEAD') == before
+    assert git(work, 'show', ':good.txt') == 'content'
+    assert (work / 'bad.txt').read_text() == 'content'

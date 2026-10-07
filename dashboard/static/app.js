@@ -75,12 +75,36 @@ new MutationObserver(records => {
   }
   const host = notificationDialogs.at(-1) || document.body;
   if ($('#toast-region').parentElement !== host) host.append($('#toast-region'));
-  if ($('#operation-region').parentElement !== host) host.prepend($('#operation-region'));
+  raiseOperations();
 }).observe(document.body, {subtree:true, attributes:true, attributeFilter:['open']});
 const activeOperations = new Map();
 let operationSequence = 0;
+function raiseOperations() {
+  const region = $('#operation-region');
+  const activeHost = notificationDialogs.at(-1) || document.body;
+  if (region.parentElement !== activeHost) {
+    if (region.hidePopover && region.matches(':popover-open')) region.hidePopover();
+    activeHost.append(region); // stay inside the active modal's non-inert subtree
+  }
+  if (activeOperations.size && region.showPopover) {
+    if (region.matches(':popover-open')) region.hidePopover();
+    region.showPopover();
+  } else if (activeOperations.size) {
+    // Older WebView2: place the indicator inside the active modal, at its
+    // visible viewport coordinates rather than in its scrolling content.
+    region.removeAttribute('popover');
+    const host = notificationDialogs.at(-1) || document.body;
+    if (region.parentElement !== host) host.prepend(region);
+    const bounds = host === document.body ? null : host.getBoundingClientRect();
+    region.style.top = (bounds ? bounds.top + 12 : 18) + 'px';
+    region.style.left = bounds ? (bounds.left + bounds.width / 2) + 'px' : '50%';
+  }
+}
 function renderOperations() {
   const region = $('#operation-region'); region.hidden = activeOperations.size === 0;
+  if (!activeOperations.size && region.hidePopover && region.matches(':popover-open')) region.hidePopover();
+  if (activeOperations.size && region.showPopover && !region.matches(':popover-open')) region.showPopover();
+  if (activeOperations.size && !region.showPopover) raiseOperations();
   region.replaceChildren();
   for (const item of activeOperations.values()) {
     const row = document.createElement('div'); row.className = 'operation-status';
@@ -96,13 +120,32 @@ async function busy(button, fn) {
   const labels = {commit:'Подготовка и создание коммита',push:'Проверка и отправка коммитов',pull:'Загрузка изменений из Git',unstage:'Отмена подготовки файлов',diagnostics:'Диагностика Git',check:'Проверка репозитория',refresh:'Обновление списка файлов'};
   const action = button?.dataset.gitAction;
   const label = labels[action] || (button?.textContent.trim() ? button.textContent.trim() + ' — выполняется' : 'Операция выполняется');
-  activeOperations.set(id, {label, started:Date.now()}); renderOperations();
+  activeOperations.set(id, {label, action, projectId:selectedId, started:Date.now()}); renderOperations();
   if (button) { button.disabled = true; button.setAttribute('aria-busy', 'true'); }
   try { return await fn(); } catch (error) { toast(error.message, true); }
   finally {
     activeOperations.delete(id); renderOperations();
     if (button) { button.disabled = false; button.removeAttribute('aria-busy'); }
   }
+}
+
+
+async function gitRequest(pid, suffix, options, action) {
+  const operationId = crypto.randomUUID();
+  const item = [...activeOperations.values()].reverse().find(value => value.action === action && value.projectId === pid);
+  let polling = false, finished = false;
+  const poll = async () => {
+    if (polling || finished) return;
+    polling = true;
+    try {
+      const progress = await api(`/projects/${pid}/git/progress?operation_id=${operationId}`);
+      if (item && !finished) { item.label = progress.stage + (progress.total ? `: ${progress.completed} из ${progress.total}` : ''); renderOperations(); }
+    } catch (_) { /* Status may not exist yet; the operation request reports errors. */ }
+    finally { polling = false; }
+  };
+  const timer = setInterval(poll, 700);
+  try { return await api(`/projects/${pid}/git/${suffix}`, {...options, headers:{...(options.headers || {}), 'X-Devlin-Operation':operationId}}); }
+  finally { finished = true; clearInterval(timer); }
 }
 
 function confirmAction(title, description, extra = '') {
@@ -343,7 +386,7 @@ async function gitAction(action) {
     if (h.behind) throw new Error('На origin есть новые коммиты. Сначала обновите чистый проект через pull или согласуйте историю вручную.');
     if (!h.ahead) { toast('Неотправленных коммитов нет'); return; }
     if (!await confirmAction('Отправить неотправленные коммиты?', `Ветка: ${h.branch}\n${h.remote}\nБудут отправлены все ${h.ahead} неотправленных коммитов этой ветки без force push.`, h.outgoing.map(c => `${c.short_hash} · ${c.subject} · ${c.author}`).join('\n') + (h.ahead > h.outgoing.length ? '\nПоказаны первые 50 коммитов.' : ''))) return;
-    const result = await api(`/projects/${id}/git/push`, {method:'POST',body:{confirm:true,expected_head:h.head,expected_branch:h.branch,expected_remote:h.remote}});
+    const result = await gitRequest(id, 'push', {method:'POST',body:{confirm:true,expected_head:h.head,expected_branch:h.branch,expected_remote:h.remote}}, 'push');
     toast(result.message); await loadGit(); return;
   }
   if (action === 'pull') {
@@ -356,7 +399,13 @@ async function gitAction(action) {
     const data = {snapshot:gitData.snapshot, files, message, push};
     if (!gitData.connected) { data.remote = $('#git-remote').value.trim(); data.branch = $('#git-branch').value.trim(); if (!data.remote || !data.branch) throw new Error('Укажите URL репозитория и ветку'); }
     if (!await confirmAction(gitData.connected ? 'Принять изменения сервера в Git?' : 'Создать репозиторий на сервере?', `${files.length} файлов будут добавлены в коммит «${message}».\n${push ? 'Коммит будет отправлен в выбранную ветку origin.' : 'Коммит останется только на сервере.'}\nПроверьте, что в файлах нет паролей и других секретов.`, files.join('\n'))) return;
-    const result = await api(`/projects/${id}/git/${gitData.connected ? 'sync' : 'init'}`, {method:'POST', body:data});
+    let result;
+    try { result = await gitRequest(id, gitData.connected ? 'sync' : 'init', {method:'POST', body:data}, 'commit'); }
+    catch (error) {
+      try { await loadGit(); } catch (_) { /* Preserve the original operation error if refreshing also fails. */ }
+      throw error;
+    } // show any index changes left by a failed add/hook
+
     toast(result.warning || `Коммит ${result.commit} ${result.pushed ? 'отправлен в origin' : 'создан на сервере'}`, Boolean(result.warning));
     await loadGit(); $('#git-history-panel')?.scrollIntoView({behavior:'smooth',block:'start'});
   }
