@@ -48,9 +48,18 @@ def network(conn, arguments, remote):
     """Supply credentials through SSH stdin and process environment, never URL/argv/disk."""
     validate_remote(remote)
     profile = getattr(conn, 'git_profile', None)
-    common = "GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=yes' "
+    # The server may select a non-default key using core.sshCommand. A fixed
+    # GIT_SSH_COMMAND overrides that setting and silently loses the identity.
+    # Keep Git's command precedence, then add noninteractive/trust options.
+    setup = ('devlin_git_ssh=${GIT_SSH_COMMAND:-}; '
+             'if test -z "$devlin_git_ssh"; then '
+             'devlin_git_ssh=$(git config --get core.sshCommand) || devlin_git_ssh=ssh; fi; '
+             'if test -z "$devlin_git_ssh"; then devlin_git_ssh=ssh; fi; ')
+    common = ('GIT_TERMINAL_PROMPT=0 '
+              'GIT_SSH_COMMAND="$devlin_git_ssh -o BatchMode=yes -o StrictHostKeyChecking=yes" ')
+
     if not profile:
-        return conn.run(common + 'git ' + arguments, timeout=90)
+        return conn.run(setup + common + 'git ' + arguments, timeout=90)
     repository_path(profile, remote)  # Never send a profile's token to another service.
     version = conn.text('git --version').strip()
     match = re.search(r'(\d+)\.(\d+)', version)
@@ -72,7 +81,7 @@ def network(conn, arguments, remote):
               ('http.followRedirects', 'false'), ('http.sslVerify', 'true'),
               ('http.' + remote + '.followRedirects', 'false'), ('http.' + remote + '.sslVerify', 'true'),
               ('http.' + remote + '.extraHeader', None)]
-    script = ('IFS= read -r DEVLIN_GIT_AUTH || exit 71; unset GIT_SSL_NO_VERIFY GIT_CURL_VERBOSE; ' + common +
+    script = (setup + 'IFS= read -r DEVLIN_GIT_AUTH || exit 71; unset GIT_SSL_NO_VERIFY GIT_CURL_VERBOSE; ' + common +
               'GIT_TRACE=0 GIT_TRACE_CURL=0 GIT_TRACE_PACKET=0 GIT_TRACE2=0 GIT_TRACE2_EVENT=0 GIT_TRACE2_PERF=0 ' +
               f'GIT_CONFIG_COUNT={len(config)} ')
     for index, (key, value) in enumerate(config):
@@ -88,9 +97,9 @@ def check_remote(conn):
         return {'ok': False, 'message': 'Репозиторий не подключён. Выберите его через кнопку «Подключить репозиторий».',
                 'local_git': current['connected'], 'remote': ''}
     remote = conn.text('git config --get remote.origin.url').strip()
-    code, _, _ = network(conn, 'ls-remote origin', remote)
+    code, _, error = network(conn, 'ls-remote origin', remote)
     if code:
-        raise RemoteError('Репозиторий настроен, но Git-доступ с сервера не прошёл. Проверьте токен/SSH-ключ, сеть сервера и права репозитория.')
+        raise command_failure(code, error, 'Проверка доступа к репозиторию')
     return {'ok': True, 'local_git': True, 'remote': remote,
             'message': 'Репозиторий подключён, доступ на чтение с сервера проверен. Право записи проверяется при push.'}
 
@@ -111,9 +120,9 @@ def attach(conn, request):
     profile = getattr(conn, 'git_profile', None)
     if profile:
         Provider(profile, conn.git_token).repository(request.remote)
-    code, _, _ = network(conn, 'ls-remote ' + shlex.quote(request.remote), request.remote)
+    code, _, error = network(conn, 'ls-remote ' + shlex.quote(request.remote), request.remote)
     if code:
-        raise RemoteError('Репозиторий недоступен с сервера. Подключение не изменено; проверьте авторизацию и сеть.')
+        raise command_failure(code, error, 'Подключение не изменено; проверка доступа к репозиторию')
     if current['remote'] and current['remote'] != request.remote and not request.replace_remote:
         raise RemoteError('У проекта уже есть origin. Подтвердите замену адреса; файлы и история останутся на сервере.')
     latest = status(conn)
@@ -437,7 +446,7 @@ def initialize(conn, request, settings):
         raise RemoteError('Есть запрещённые пути')
     if getattr(conn, 'git_profile', None):
         Provider(conn.git_profile, conn.git_token).repository(request.remote)
-        code, _, _ = network(conn, 'ls-remote ' + shlex.quote(request.remote), request.remote)
+        code, _, error = network(conn, 'ls-remote ' + shlex.quote(request.remote), request.remote)
         if code:
             raise RemoteError('Репозиторий недоступен с сервера. Проверьте Git-профиль перед выгрузкой.')
     conn.text('git init -b ' + shlex.quote(request.branch))

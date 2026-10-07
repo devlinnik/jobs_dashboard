@@ -350,3 +350,58 @@ def test_secret_and_unsafe_files_rejected(path):
 def test_credential_urls_and_unsafe_remotes_rejected(remote):
     with pytest.raises(RemoteError):
         gitops.validate_remote(remote)
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize('setting', ['core.sshCommand', 'GIT_SSH_COMMAND', 'default'])
+def test_network_uses_server_identity_and_noninteractive_ssh_options(repo, tmp_path, setting):
+    import json
+    import shlex
+    import sys
+    work, _ = repo
+    log = tmp_path / 'ssh-arguments.json'
+    script = tmp_path / 'fake ssh.py'
+    script.write_text('import json, os, sys\nopen(os.environ["DEVLIN_SSH_LOG"], "w").write(json.dumps(sys.argv[1:]))\n', encoding='utf-8')
+    command = shlex.quote(sys.executable) + ' ' + shlex.quote(str(script)) + ' -i ' + shlex.quote('/server/key with spaces')
+    env = {'DEVLIN_SSH_LOG': str(log), 'GIT_SSH_VARIANT': 'ssh', 'GIT_SSH_COMMAND': '', 'GIT_CONFIG_GLOBAL': os.devnull}
+    if setting == 'core.sshCommand':
+        git(work, 'config', '--local', 'core.sshCommand', command)
+    elif setting == 'GIT_SSH_COMMAND':
+        git(work, 'config', '--local', 'core.sshCommand', 'false')  # environment has priority
+        env['GIT_SSH_COMMAND'] = command
+    else:
+        ssh = tmp_path / 'ssh'
+        ssh.write_text('#!/bin/sh\nexec ' + command + ' "$@"\n')
+        ssh.chmod(0o700)
+        env['PATH'] = str(tmp_path) + os.pathsep + os.environ['PATH']
+    remote = 'git@github.com:owner/project.git'
+    code, _, _ = gitops.network(LocalConnection(work, env), 'ls-remote ' + shlex.quote(remote), remote)
+    # The fake transport deliberately does not speak the Git protocol, but real
+    # Git must invoke it with the selected identity and literal argument boundaries.
+    assert code != 0
+    arguments = json.loads(log.read_text())
+    assert arguments[:2] == ['-i', '/server/key with spaces']
+    assert 'BatchMode=yes' in arguments and 'StrictHostKeyChecking=yes' in arguments
+    assert 'git@github.com' in arguments
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize('operation', ['check', 'attach'])
+@pytest.mark.parametrize(('stderr', 'message'), [
+    ('Permission denied (publickey).', 'Нет доступа'),
+    ('Host key verification failed.', 'не подтверждён ключ'),
+    ('Could not resolve hostname github.com.', 'DNS'),
+])
+def test_repository_access_reports_safe_specific_errors(repo, monkeypatch, operation, stderr, message):
+    work, conn = repo
+    remote = 'git@github.com:owner/project.git'
+    git(work, 'remote', 'add', 'origin', remote)
+    current = gitops.status(conn)
+    monkeypatch.setattr(gitops, 'network', lambda *args: (128, b'', (stderr + '\nhttps://secret-token@example.test/private').encode()))
+    request = SimpleNamespace(remote=remote, branch='main', snapshot=current['snapshot'], expected_remote=remote,
+                              expected_git_profile_id='', replace_remote=False, confirm=True)
+    with pytest.raises(RemoteError) as raised:
+        gitops.check_remote(conn) if operation == 'check' else gitops.attach(conn, request)
+    assert message in str(raised.value)
+    assert 'secret-token' not in str(raised.value)
+    assert git(work, 'remote', 'get-url', 'origin') == remote
