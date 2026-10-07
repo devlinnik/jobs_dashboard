@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from playwright.sync_api import sync_playwright, expect
 from tests.test_ssh import ssh_server
+from tests.git_https_server import git_https_server, TOKEN
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -35,7 +36,9 @@ def main():
         thread = threading.Thread(target=website.serve_forever,daemon=True); thread.start()
         stack.callback(website.server_close); stack.callback(website.shutdown)
         port = free_port()
-        proc = subprocess.Popen([sys.executable,str(ROOT/'run.py'),'--no-open','--port',str(port),'--data-dir',str(temp/'data')],cwd=ROOT,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+        git_host = stack.enter_context(git_https_server(temp/'git-https'))
+        proc = subprocess.Popen([sys.executable,str(ROOT/'run.py'),'--no-open','--port',str(port),'--data-dir',str(temp/'data')],cwd=ROOT,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,
+            env=os.environ | {'SSL_CERT_FILE':str(git_host['ca']), 'NO_PROXY':'127.0.0.1,localhost'})
         def stop():
             proc.terminate()
             try: proc.wait(timeout=20)
@@ -49,12 +52,8 @@ def main():
         else: raise AssertionError('UI server did not start')
         server_files = temp/'server'; server_files.mkdir()
         (server_files/'index.php').write_text('<?php echo "Initial";')
-        bare = temp/'gitlab.git'
-        subprocess.run(['git','init','--bare',str(bare)],check=True,capture_output=True)
-        fake_url = 'git@gitlab.test:team/project.git'
-        config = temp/'git-test.conf'
-        config.write_text('[url "'+bare.as_uri()+'"]\n\tinsteadOf = '+fake_url+'\n')
-        ssh_port, key = stack.enter_context(ssh_server({'GIT_CONFIG_GLOBAL':str(config),'GIT_ALLOW_PROTOCOL':'file:ssh'}, home=str(temp)))
+        bare = git_host['bare']
+        ssh_port, key = stack.enter_context(ssh_server({'GIT_SSL_CAINFO':str(git_host['ca']), 'NO_PROXY':'127.0.0.1,localhost'}, home=str(temp)))
         with sync_playwright() as playwright:
             executable = os.environ.get('CHROMIUM_PATH')
             if not executable and Path('/usr/bin/chromium').exists(): executable = '/usr/bin/chromium'
@@ -63,7 +62,7 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            expect(page.locator('#app-version')).to_have_text('v1.3.0')
+            expect(page.locator('#app-version')).to_have_text('v1.4.0')
             page.locator('[data-nav=ssh-profiles]').click()
             expect(page.locator('#ssh-profiles-page')).to_be_visible()
             page.locator('#new-ssh-profile').click()
@@ -83,6 +82,20 @@ def main():
             expect(page.get_by_text('SSH-профиль подключён. Теперь выберите папку для проекта.', exact=True)).to_be_visible()
             page.locator('[data-close=ssh-profile-dialog]').first.click()
             expect(page.locator('.ssh-profile-row')).to_have_count(1)
+            page.locator('[data-nav=git-profiles]').click()
+            page.locator('#new-git-profile').click()
+            git_form = page.locator('#git-profile-form')
+            git_form.locator('[name=name]').fill('Рабочий GitLab')
+            git_form.locator('[name=provider]').select_option('gitlab')
+            git_form.locator('[name=base_url]').fill(git_host['base'])
+            git_form.locator('[name=token]').fill(TOKEN)
+            git_form.locator('button[type=submit]').click()
+            expect(page.locator('#git-profile-test')).to_be_enabled()
+            page.locator('#git-profile-test').click()
+            expect(page.locator('#git-profile-info')).to_have_text('Авторизация проверена: developer')
+            page.locator('[data-close=git-profile-dialog]').first.click()
+            screenshot = ROOT/'test-results'; screenshot.mkdir(exist_ok=True)
+            page.screenshot(path=str(screenshot/'git-profiles.png'))
             page.locator('[data-nav=projects]').click()
             page.locator('#hero-add').click()
             form=page.locator('#project-form')
@@ -100,6 +113,7 @@ def main():
             expect(form.locator('[name=ssh_path]')).to_have_value(str(server_files))
             assert page.evaluate("fetch('/api/projects').then(r=>r.json()).then(p=>p.length)") == 0
             form.locator('[name=git_branch]').fill('main')
+            form.locator('[name=git_profile_id]').select_option(label='Рабочий GitLab · gitlab')
             form.locator('button[type=submit]').click()
             expect(page.locator('#project-form-dialog')).not_to_be_visible()
             expect(page.locator('.project-card')).to_have_count(1)
@@ -134,12 +148,20 @@ def main():
             page.locator('[data-detail-action=check]').click()
             expect(page.locator('.big-value').first).to_contain_text('HTTP 200')
             page.locator('[data-tab=git]').click()
-            try:
-                expect(page.locator('#git-remote')).to_be_visible(timeout=20000)
-            except AssertionError:
-                print('Git panel diagnostic:', page.locator('#detail-content').inner_text())
-                raise
-            page.locator('#git-remote').fill(fake_url)
+            page.locator('[data-git-action=check]').click()
+            expect(page.get_by_text('Репозиторий не подключён. Выберите его через кнопку «Подключить репозиторий».',exact=True)).to_be_visible()
+            page.locator('[data-git-action=attach]').click()
+            page.locator('#git-repository-picker').click()
+            expect(page.locator('[data-repository-index]')).to_have_count(1)
+            page.locator('[data-repository-index]').click()
+            expect(page.locator('#git-connect-remote')).to_have_value(git_host['remote'])
+            page.locator('#git-connect-form button[type=submit]').click()
+            expect(page.locator('#confirm-dialog')).to_be_visible()
+            page.locator('#confirm-accept').click()
+            expect(page.locator('#git-connect-dialog')).not_to_be_visible(timeout=20000)
+            expect(page.locator('#detail-content')).to_contain_text(git_host['remote'])
+            page.locator('[data-git-action=check]').click()
+            expect(page.get_by_text('Репозиторий подключён, доступ на чтение с сервера проверен. Право записи проверяется при push.',exact=True)).to_be_visible(timeout=20000)
             page.locator('[data-git-action=commit]').click()
             expect(page.locator('#confirm-dialog')).to_be_visible()
             page.locator('#confirm-accept').click()
@@ -200,7 +222,7 @@ def main():
                 assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), f'Horizontal overflow at {width}px'
             assert errors == [], errors
             browser.close()
-            print('UI smoke passed: SSH profiles, SFTP browsing/path selection, probe HTTPS validation, CRUD, HTTP, Git init/diff/commit/push, journal, filters, PIN, XSS escaping, responsive layout. Screenshots: test-results/dashboard.png and ssh-browser.png')
+            print('UI smoke passed: SSH/Git profiles, provider authorization, repository picker/attach/access check, verified HTTPS Git push, SFTP browsing, probe HTTPS validation, CRUD, HTTP, diff/commit, journal, filters, PIN, XSS escaping, responsive layout. Screenshots: test-results/dashboard.png, ssh-browser.png, git-profiles.png')
 
 
 if __name__ == '__main__': main()

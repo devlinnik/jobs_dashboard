@@ -37,6 +37,45 @@ def repo(tmp_path):
 
 
 @POSIX_ONLY
+def test_attach_existing_git_and_confirmed_origin_replacement_preserve_history(repo, tmp_path):
+    work, original = repo
+    first, second = tmp_path/'first.git', tmp_path/'second.git'
+    for path in (first, second): git(tmp_path, 'init', '--bare', str(path))
+    config = tmp_path/'git.config'
+    urls = ['git@gitlab.test:team/first.git', 'git@gitlab.test:team/second.git']
+    config.write_text(''.join('[url "'+path.as_uri()+'"]\n\tinsteadOf = '+url+'\n' for path,url in zip((first,second),urls)))
+    conn = LocalConnection(work, {'GIT_CONFIG_GLOBAL':str(config), 'GIT_ALLOW_PROTOCOL':'file:ssh'})
+    before = git(work, 'rev-parse', 'HEAD')
+    (work/'index.php').write_text('uncommitted server edits')
+    current = gitops.status(conn)
+    request = SimpleNamespace(remote=urls[0], branch='main', snapshot=current['snapshot'], expected_remote='',
+                              expected_git_profile_id='', replace_remote=False, confirm=True)
+    assert gitops.attach(conn, request)['ok']
+    assert git(work,'config','--get','remote.origin.url') == urls[0]
+    git(work, 'config', 'remote.origin.pushurl', urls[0])
+    current = gitops.status(conn)
+    request.remote = urls[1]; request.snapshot = current['snapshot']; request.expected_remote = urls[0]
+    with pytest.raises(RemoteError, match='Подтвердите замену'): gitops.attach(conn, request)
+    assert git(work,'config','--get','remote.origin.url') == urls[0]
+    request.replace_remote = True
+    assert gitops.attach(conn, request)['ok']
+    assert git(work,'config','--get','remote.origin.url') == urls[1]
+    assert subprocess.run(['git','-C',str(work),'config','--get','remote.origin.pushurl'],capture_output=True).returncode == 1
+    assert git(work,'rev-parse','HEAD') == before
+    assert (work/'index.php').read_text() == 'uncommitted server edits'
+
+
+@POSIX_ONLY
+def test_attach_rejects_stale_files_before_changing_origin(repo):
+    work, conn = repo
+    request = SimpleNamespace(remote='https://github.com/team/project.git', branch='main',
+        snapshot=gitops.status(conn)['snapshot'], expected_remote='', expected_git_profile_id='', replace_remote=False, confirm=True)
+    (work/'index.php').write_text('changed after viewing')
+    with pytest.raises(RemoteError, match='Состояние репозитория изменилось'): gitops.attach(conn, request)
+    assert not gitops.status(conn)['remote']
+
+
+@POSIX_ONLY
 def test_real_git_selective_commit_preserves_unselected_files(repo):
     work, conn = repo
     (work/'index.php').write_text('v2')

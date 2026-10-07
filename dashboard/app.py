@@ -10,14 +10,16 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, field_validator
 from .store import Store, now
 from .security import Sessions, hash_pin, verify_pin
-from .models import ProjectInput, SettingsInput, SyncInput, InitInput, SSHProfileInput, web_url
+from .models import ProjectInput, SettingsInput, SyncInput, InitInput, SSHProfileInput, GitProfileInput, GitAttachInput, web_url
 from .remote import connect, inspect_host, RemoteError
 from .monitor import Monitor, probe_script
 from . import gitops
 from .version import app_info
+from .gitprovider import Provider
 
 STATIC = Path(__file__).parent / 'static'
 
@@ -35,6 +37,12 @@ def public_profile(profile, store):
     return {k: v for k, v in profile.items() if not k.endswith('_enc')} | {
         'has_password': bool(profile.get('ssh_password_enc')),
         'project_count': sum(p.get('ssh_profile_id') == profile['id'] for p in store.projects())}
+
+
+def public_git_profile(profile, store):
+    return {k: v for k, v in profile.items() if not k.endswith('_enc')} | {
+        'has_token': bool(profile.get('token_enc')),
+        'project_count': sum(p.get('git_profile_id') == profile['id'] for p in store.projects())}
 
 
 def public_settings(settings):
@@ -67,6 +75,7 @@ def create_app(directory=None, start_monitor=True):
     store, sessions, locks = Store(directory), Sessions(), {}
     monitor = Monitor(store, locks)
     profiles_lock = asyncio.Lock()
+    git_profiles_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def lifespan(app):
@@ -108,9 +117,15 @@ def create_app(directory=None, start_monitor=True):
     async def remote_error(request, exc):
         return JSONResponse({'detail': str(exc)}, status_code=409)
 
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request, exc):
+        # Pydantic's default response echoes input, which can include tokens/passwords.
+        errors = [{key: error[key] for key in ('loc', 'msg', 'type')} for error in exc.errors()]
+        return JSONResponse({'detail': errors}, status_code=422)
+
     @app.exception_handler(KeyError)
     async def not_found(request, exc):
-        return JSONResponse({'detail': 'Проект не найден'}, status_code=404)
+        return JSONResponse({'detail': 'Проект или профиль не найден'}, status_code=404)
 
     def authenticated(request: Request):
         if not sessions.valid(request.cookies.get('desk_session')):
@@ -362,6 +377,66 @@ def create_app(directory=None, start_monitor=True):
     @app.get('/api/projects/{pid}/git', dependencies=auth)
     async def git_status(pid: str):
         return await operation(pid, gitops.status)
+
+    @app.get('/api/git-profiles', dependencies=auth)
+    def git_profiles():
+        return [public_git_profile(p, store) for p in store.git_profiles()]
+
+    @app.post('/api/git-profiles', dependencies=auth)
+    async def add_git_profile(body: GitProfileInput):
+        async with git_profiles_lock:
+            data = body.model_dump(exclude={'token', 'clear_token'})
+            data.update(id=uuid.uuid4().hex, created_at=now(), token_enc=store.encrypt(body.token or ''), account='')
+            store.save_git_profile(data)
+            return public_git_profile(data, store)
+
+    @app.put('/api/git-profiles/{profile_id}', dependencies=auth)
+    async def edit_git_profile(profile_id: str, body: GitProfileInput):
+        async with git_profiles_lock:
+            old = store.git_profile(profile_id)
+            data = old | body.model_dump(exclude={'token', 'clear_token'})
+            changed_service = (old['provider'], old['base_url']) != (data['provider'], data['base_url'])
+            if body.clear_token or changed_service:
+                data['token_enc'] = ''  # A token is never reused for another service.
+            if body.token and not body.clear_token:
+                data['token_enc'] = store.encrypt(body.token)
+            if body.token or body.clear_token or changed_service:
+                data['account'] = ''
+                data.pop('verified_at', None)
+            store.save_git_profile(data)
+            return public_git_profile(data, store)
+
+    @app.delete('/api/git-profiles/{profile_id}', dependencies=auth)
+    async def delete_git_profile(profile_id: str):
+        async with git_profiles_lock:
+            if not store.delete_git_profile(profile_id):
+                raise HTTPException(409, 'Git-профиль используется проектами. Сначала выберите для них другой профиль.')
+        return {'ok': True}
+
+    @app.post('/api/git-profiles/{profile_id}/test', dependencies=auth)
+    async def test_git_profile(profile_id: str):
+        async with git_profiles_lock:
+            profile = store.git_profile(profile_id)
+            account = await asyncio.to_thread(Provider(profile, store.decrypt(profile.get('token_enc', ''))).account)
+            profile.update(account=account['username'], verified_at=now())
+            store.save_git_profile(profile)
+        return {'ok': True, 'account': account, 'message': 'Авторизация проверена: ' + account['username']}
+
+    @app.get('/api/git-profiles/{profile_id}/repositories', dependencies=auth)
+    async def git_repositories(profile_id: str, page: int = Query(default=1, ge=1, le=1000)):
+        profile = store.git_profile(profile_id)
+        return await asyncio.to_thread(Provider(profile, store.decrypt(profile.get('token_enc', ''))).repositories, page)
+
+    @app.post('/api/projects/{pid}/git/check', dependencies=auth)
+    async def check_git_repository(pid: str):
+        return await operation(pid, gitops.check_remote)
+
+    @app.post('/api/projects/{pid}/git/attach', dependencies=auth)
+    async def attach_git_repository(pid: str, body: GitAttachInput):
+        result = await operation(pid, gitops.attach, body)
+        store.event(pid, 'success', result['message'])
+        monitor.due[pid] = 0
+        return result
 
     @app.get('/api/projects/{pid}/git/diff', dependencies=auth)
     async def git_diff(pid: str, path: str):

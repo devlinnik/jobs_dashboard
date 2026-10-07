@@ -42,6 +42,7 @@ class Store:
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ssh_profiles (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS git_profiles (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS state (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,6 +73,8 @@ class Store:
         with self.lock, self.db:
             if data.get('ssh_profile_id'):
                 self.profile(data['ssh_profile_id'])
+            if data.get('git_profile_id'):
+                self.git_profile(data['git_profile_id'])
             self.db.execute('INSERT OR REPLACE INTO projects VALUES (?, ?)', (data['id'], json.dumps(data)))
 
     def profiles(self):
@@ -99,11 +102,37 @@ class Store:
 
     def resolve_project(self, project):
         with self.lock:
+            project = project.copy()
+            if project.get('git_profile_id'):
+                project['git_profile_name'] = self.git_profile(project['git_profile_id'])['name']
             if not project.get('ssh_profile_id'):
                 return project.copy()
             profile = self.profile(project['ssh_profile_id'])
             fields = ('ssh_host', 'ssh_port', 'ssh_user', 'ssh_key', 'ssh_password_enc', 'ssh_fingerprint')
             return project | {k: profile.get(k, '') for k in fields} | {'ssh_profile_name': profile['name']}
+
+    def git_profiles(self):
+        with self.lock:
+            return [json.loads(r[0]) for r in self.db.execute('SELECT data FROM git_profiles ORDER BY rowid DESC')]
+
+    def git_profile(self, profile_id):
+        with self.lock:
+            row = self.db.execute('SELECT data FROM git_profiles WHERE id=?', (profile_id,)).fetchone()
+            if not row:
+                raise KeyError(profile_id)
+            return json.loads(row[0])
+
+    def save_git_profile(self, data):
+        with self.lock, self.db:
+            self.db.execute('INSERT OR REPLACE INTO git_profiles VALUES (?, ?)', (data['id'], json.dumps(data)))
+
+    def delete_git_profile(self, profile_id):
+        with self.lock, self.db:
+            self.git_profile(profile_id)
+            if any(p.get('git_profile_id') == profile_id for p in self.projects()):
+                return False
+            self.db.execute('DELETE FROM git_profiles WHERE id=?', (profile_id,))
+            return True
 
     def migrate_ssh_profiles(self):
         """Move legacy credentials once; share only identical, equally trusted connections."""

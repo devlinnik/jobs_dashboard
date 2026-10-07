@@ -48,7 +48,7 @@ class Connection:
         self.project = project
         self.path = project['ssh_path']
 
-    def run(self, command, timeout=35, max_output=2_000_000, in_project=True):
+    def run(self, command, timeout=35, max_output=2_000_000, in_project=True, input_data=None):
         if in_project and not self.path:
             raise RemoteError('Папка проекта не выбрана. Откройте SSH-проводник в настройках проекта.')
         full = ('cd -- ' + shlex.quote(self.path) + ' && ' if in_project else '') + command
@@ -58,6 +58,9 @@ class Connection:
         stdout, stderr = bytearray(), bytearray()
         deadline = time.monotonic() + timeout
         try:
+            if input_data is not None:
+                channel.sendall(input_data)
+            channel.shutdown_write()
             while True:
                 if time.monotonic() > deadline:
                     raise RemoteError('SSH-команда превысила время ожидания. Проверьте состояние на сервере перед повтором.')
@@ -171,6 +174,9 @@ def connect(store, project, require_project=True):
                        allow_agent=True, look_for_keys=True)
         client.get_transport().set_keepalive(20)
         conn = Connection(client, project)
+        if project.get('git_profile_id'):
+            conn.git_profile = store.git_profile(project['git_profile_id'])
+            conn.git_token = store.decrypt(conn.git_profile.get('token_enc', ''))
         # Require a real directory, never create or move a server project implicitly.
         if require_project:
             conn.check_directory()

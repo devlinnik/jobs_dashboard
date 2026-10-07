@@ -59,7 +59,7 @@ def desktop_self_test(output=None):
                     raise RuntimeError('Self-test server did not start')
                 if session.get('pin_enabled') is not False or session.get('authenticated') is not False:
                     raise RuntimeError('Self-test did not use isolated application data')
-                for path, markers in [('/', (b'Devlin Desk', b'ssh-profiles-page', b'ssh_profile_id', b'remote-browser-dialog')),
+                for path, markers in [('/', (b'Devlin Desk', b'ssh-profiles-page', b'ssh_profile_id', b'remote-browser-dialog', b'git-profiles-page', b'git-connect-dialog')),
                                       ('/static/app.js', (b'loadProjects', b'/ssh-profiles/${profileId}/directories', b'/app-info')),
                                       ('/static/styles.css', (b'--mint',))]:
                     with local.open(base + path, timeout=5) as response:
@@ -69,6 +69,7 @@ def desktop_self_test(output=None):
                 from dashboard.version import app_info
                 info = app_info()
                 checks = ['local-api', 'isolated-data', 'html', 'javascript', 'css', 'application-icons', 'ssh-profile-interface']
+                checks.append('git-profile-interface')
                 if sys.platform == 'win32':
                     checks.append('tray-dependencies')
                     if getattr(sys, 'frozen', False):

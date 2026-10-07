@@ -36,6 +36,7 @@ class ProjectInput(BaseModel):
     disk_token: str | None = Field(default=None, max_length=2048)
     disk_threshold: int = Field(default=15, ge=1, le=95)
     git_monitor: bool = True
+    git_profile_id: str = Field(default='', max_length=100)
     auto_sync: bool = False
     auto_push: bool = True
     git_branch: str = Field(default='', max_length=100)
@@ -105,6 +106,33 @@ class SSHProfileInput(BaseModel):
         return self
 
 
+class GitProfileInput(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    provider: str = 'github'
+    base_url: str = Field(default='https://github.com', max_length=2048)
+    token: str | None = Field(default=None, max_length=2048)
+    clear_token: bool = False
+
+    @model_validator(mode='after')
+    def validate_profile(self):
+        self.name = self.name.strip()
+        if not self.name or any(c in self.name for c in '\x00\r\n'):
+            raise ValueError('Укажите название профиля')
+        if self.provider not in ('github', 'gitlab'):
+            raise ValueError('Выберите GitHub или GitLab')
+        self.base_url = web_url(self.base_url.strip().rstrip('/'), https=True)
+        parsed = urlsplit(self.base_url)
+        if not self.base_url or parsed.path or parsed.query or parsed.fragment:
+            raise ValueError('Укажите HTTPS адрес сервиса без пути, например https://gitlab.com')
+        if any(c.isspace() or ord(c) < 32 for c in self.base_url) or (parsed.port is not None and not 1 <= parsed.port <= 65535):
+            raise ValueError('Некорректный HTTPS адрес сервиса')
+        if self.provider == 'github' and self.base_url != 'https://github.com':
+            raise ValueError('Для GitHub используйте https://github.com')
+        if self.token is not None and (not self.token or any(c.isspace() or ord(c) < 32 for c in self.token)):
+            raise ValueError('Токен не должен содержать пробелы или управляющие символы')
+        return self
+
+
 class SettingsInput(BaseModel):
     telegram_token: str | None = Field(default=None, max_length=300)
     clear_telegram_token: bool = False
@@ -155,3 +183,13 @@ class SyncInput(BaseModel):
 class InitInput(SyncInput):
     remote: str = Field(max_length=2048)
     branch: str = Field(default='main', min_length=1, max_length=100)
+
+
+class GitAttachInput(BaseModel):
+    remote: str = Field(min_length=1, max_length=2048)
+    branch: str = Field(default='main', min_length=1, max_length=100)
+    snapshot: str
+    expected_remote: str = Field(default='', max_length=2048)
+    expected_git_profile_id: str = Field(default='', max_length=100)
+    replace_remote: bool = False
+    confirm: bool = False

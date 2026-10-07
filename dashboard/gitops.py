@@ -1,4 +1,5 @@
 import hashlib
+import base64
 import json
 import re
 import shlex
@@ -6,6 +7,7 @@ import stat
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 from .remote import RemoteError
+from .gitprovider import Provider, repository_path
 
 EXCLUDED_DIRS = {'.git', '.ssh', '.venv', 'venv', 'node_modules', 'vendor', '__pycache__', '.idea'}
 SECRET_NAMES = {'.env', 'id_rsa', 'id_ed25519', 'credentials.json', 'vault.key', 'desk.sqlite3', 'auth.json'}
@@ -42,6 +44,91 @@ def validate_branch(branch):
     return branch
 
 
+def network(conn, arguments, remote):
+    """Supply credentials through SSH stdin and process environment, never URL/argv/disk."""
+    validate_remote(remote)
+    profile = getattr(conn, 'git_profile', None)
+    common = "GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=yes' "
+    if not profile:
+        return conn.run(common + 'git ' + arguments, timeout=90)
+    repository_path(profile, remote)  # Never send a profile's token to another service.
+    version = conn.text('git --version').strip()
+    match = re.search(r'(\d+)\.(\d+)', version)
+    if not match or tuple(map(int, match.groups())) < (2, 31):
+        raise RemoteError('Git-профили требуют Git 2.31+ на сервере. Обновите Git или используйте серверный SSH-ключ без Git-профиля.')
+    if arguments.split()[:2] in (['ls-remote', 'origin'], ['push', 'origin']) or arguments.startswith('pull --ff-only origin '):
+        for option in ('--all', '--push --all'):
+            urls = conn.text('git remote get-url ' + option + ' origin').strip().splitlines()
+            if urls != [remote]:
+                raise RemoteError('Адрес fetch/push отличается от origin (pushurl или insteadOf). Настройте один HTTPS адрес выбранного репозитория.')
+    token = getattr(conn, 'git_token', '')
+    if not token:
+        raise RemoteError('В выбранном Git-профиле нет токена.')
+    username = 'x-access-token' if profile['provider'] == 'github' else 'oauth2'
+    authorization = base64.b64encode((username + ':' + token).encode()).decode()
+    # Git >= 2.31 supports runtime configuration in the environment. Clear helpers,
+    # disable redirects, require TLS, and scope the header to this exact repository URL.
+    config = [('credential.helper', ''), ('http.extraHeader', ''),
+              ('http.followRedirects', 'false'), ('http.sslVerify', 'true'),
+              ('http.' + remote + '.followRedirects', 'false'), ('http.' + remote + '.sslVerify', 'true'),
+              ('http.' + remote + '.extraHeader', None)]
+    script = ('IFS= read -r DEVLIN_GIT_AUTH || exit 71; unset GIT_SSL_NO_VERIFY GIT_CURL_VERBOSE; ' + common +
+              'GIT_TRACE=0 GIT_TRACE_CURL=0 GIT_TRACE_PACKET=0 GIT_TRACE2=0 GIT_TRACE2_EVENT=0 GIT_TRACE2_PERF=0 ' +
+              f'GIT_CONFIG_COUNT={len(config)} ')
+    for index, (key, value) in enumerate(config):
+        script += f'GIT_CONFIG_KEY_{index}=' + shlex.quote(key) + ' '
+        script += f'GIT_CONFIG_VALUE_{index}=' + ('"Authorization: Basic $DEVLIN_GIT_AUTH"' if value is None else shlex.quote(value)) + ' '
+    script += 'git -c protocol.file.allow=never -c protocol.ext.allow=never ' + arguments
+    return conn.run(script, timeout=90, input_data=(authorization + '\n').encode())
+
+
+def check_remote(conn):
+    current = status(conn)
+    if not current['connected'] or not current['remote']:
+        return {'ok': False, 'message': 'Репозиторий не подключён. Выберите его через кнопку «Подключить репозиторий».',
+                'local_git': current['connected'], 'remote': ''}
+    remote = conn.text('git config --get remote.origin.url').strip()
+    code, _, _ = network(conn, 'ls-remote origin', remote)
+    if code:
+        raise RemoteError('Репозиторий настроен, но Git-доступ с сервера не прошёл. Проверьте токен/SSH-ключ, сеть сервера и права репозитория.')
+    return {'ok': True, 'local_git': True, 'remote': remote,
+            'message': 'Репозиторий подключён, доступ на чтение с сервера проверен. Право записи проверяется при push.'}
+
+
+def attach(conn, request):
+    if not request.confirm:
+        raise RemoteError('Подтвердите подключение репозитория')
+    if getattr(conn, 'project', {}).get('git_profile_id', '') != request.expected_git_profile_id:
+        raise RemoteError('Git-профиль проекта изменился. Обновите вкладку Git и повторите подключение.')
+    validate_remote(request.remote)
+    validate_branch(request.branch)
+    current = status(conn)
+    if current['snapshot'] != request.snapshot or current['remote'] != request.expected_remote:
+        raise RemoteError('Состояние репозитория изменилось. Обновите вкладку Git и повторите подключение.')
+    configured = getattr(conn, 'project', {}).get('git_branch', '')
+    if not current['connected'] and configured and configured != request.branch:
+        raise RemoteError('Начальная ветка должна совпадать с выбранной веткой проекта')
+    profile = getattr(conn, 'git_profile', None)
+    if profile:
+        Provider(profile, conn.git_token).repository(request.remote)
+    code, _, _ = network(conn, 'ls-remote ' + shlex.quote(request.remote), request.remote)
+    if code:
+        raise RemoteError('Репозиторий недоступен с сервера. Подключение не изменено; проверьте авторизацию и сеть.')
+    if current['remote'] and current['remote'] != request.remote and not request.replace_remote:
+        raise RemoteError('У проекта уже есть origin. Подтвердите замену адреса; файлы и история останутся на сервере.')
+    latest = status(conn)
+    if latest['snapshot'] != current['snapshot'] or latest['remote'] != current['remote']:
+        raise RemoteError('Файлы или origin изменились во время проверки доступа. Обновите вкладку Git и повторите подключение.')
+    if not current['connected']:
+        conn.text('git init -b ' + shlex.quote(request.branch))
+    if not current['remote']:
+        conn.text('git remote add origin ' + shlex.quote(request.remote))
+    elif current['remote'] != request.remote:
+        conn.text('git remote set-url origin ' + shlex.quote(request.remote))
+        conn.run('git config --unset-all remote.origin.pushurl')
+    return {'ok': True, 'message': 'Репозиторий подключён. Файлы и коммиты не изменены. Для выгрузки выберите файлы и создайте коммит.'}
+
+
 def snapshot(conn, raw, files, head=''):
     # Include actual file content hashes: stale previews cannot stage a later edit silently.
     paths = [f['path'] for f in files if safe_file(f['path'])]
@@ -50,7 +137,7 @@ def snapshot(conn, raw, files, head=''):
         batch = paths[start:start + 100]
         command = 'for f in ' + ' '.join(shlex.quote(p) for p in batch) + '; do if test -f "$f" || test -L "$f"; then git hash-object -- "$f" || exit; else printf "deleted\\n"; fi; done'
         hashes += conn.text(command)
-    return hashlib.sha256((head + raw + hashes).encode()).hexdigest()
+    return hashlib.sha256((conn.path + '\0' + head + raw + hashes).encode()).hexdigest()
 
 
 def candidates(conn):
@@ -151,12 +238,14 @@ def commit(conn, current, files, message, settings, push=True):
     if push:
         remote = conn.text('git config --get remote.origin.url').strip()
         validate_remote(remote)
+        push_error = ''
         try:
-            code, _, _ = conn.run("GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=yes' git push origin HEAD", timeout=90)
-        except RemoteError:
+            code, _, _ = network(conn, 'push origin HEAD', remote)
+        except RemoteError as exc:
             code = -1
+            push_error = ' ' + str(exc)
         if code:
-            result['warning'] = 'Коммит ' + head + ' создан, но push не прошёл. Проверьте ключ сервера, права ветки и remote. Используйте отдельную кнопку «Отправить коммиты» после исправления.'
+            result['warning'] = 'Коммит ' + head + ' создан, но push не прошёл. Проверьте Git-профиль или SSH-ключ сервера, права ветки и remote.' + push_error + ' Используйте отдельную кнопку «Отправить коммиты» после исправления.'
         else:
             result['pushed'] = True
     return result
@@ -187,6 +276,11 @@ def initialize(conn, request, settings):
     allowed = {f['path'] for f in current['files'] if f['allowed']}
     if any(p not in allowed for p in request.files):
         raise RemoteError('Есть запрещённые пути')
+    if getattr(conn, 'git_profile', None):
+        Provider(conn.git_profile, conn.git_token).repository(request.remote)
+        code, _, _ = network(conn, 'ls-remote ' + shlex.quote(request.remote), request.remote)
+        if code:
+            raise RemoteError('Репозиторий недоступен с сервера. Проверьте Git-профиль перед выгрузкой.')
     conn.text('git init -b ' + shlex.quote(request.branch))
     conn.text('git remote add origin ' + shlex.quote(request.remote))
     fresh = status(conn)
@@ -206,8 +300,10 @@ def pull(conn):
         raise RemoteError('Обновление возможно только в подключённом репозитории без локальных изменений')
     if current['branch'] == '(detached HEAD)':
         raise RemoteError('Выберите ветку на сервере')
-    validate_remote(conn.text('git config --get remote.origin.url').strip())
-    conn.text("GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=yes' git pull --ff-only origin " + shlex.quote(current['branch']), timeout=90)
+    remote = conn.text('git config --get remote.origin.url').strip()
+    code, _, _ = network(conn, 'pull --ff-only origin ' + shlex.quote(current['branch']), remote)
+    if code:
+        raise RemoteError('Pull не выполнен. Проверьте Git-доступ и расхождение истории; перед повтором обновите состояние проекта.')
     return {'message': 'Ветка обновлена без перезаписи локальных изменений'}
 
 
@@ -216,6 +312,8 @@ def push(conn):
     enforce_branch(conn, current)
     if not current['connected'] or current['branch'] == '(detached HEAD)':
         raise RemoteError('Нужен репозиторий с выбранной веткой')
-    validate_remote(conn.text('git config --get remote.origin.url').strip())
-    conn.text("GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=yes' git push origin HEAD", timeout=90)
+    remote = conn.text('git config --get remote.origin.url').strip()
+    code, _, _ = network(conn, 'push origin HEAD', remote)
+    if code:
+        raise RemoteError('Push не выполнен. Проверьте Git-доступ, права выбранной ветки и расхождение истории.')
     return {'message': 'Коммиты отправлены в текущую ветку origin'}

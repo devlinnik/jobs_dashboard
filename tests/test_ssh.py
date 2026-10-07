@@ -24,7 +24,14 @@ class TestServer(paramiko.ServerInterface):
     def check_channel_exec_request(self, channel, command):
         def execute():
             try:
-                proc = subprocess.run(command.decode(),shell=True,capture_output=True,timeout=15,env=self.env)
+                data = bytearray()
+                channel.settimeout(15)
+                while True:
+                    chunk = channel.recv(4096)
+                    if not chunk: break
+                    data.extend(chunk)
+                    if len(data) > 8192: raise ValueError('Test command stdin too large')
+                proc = subprocess.run(command.decode(),shell=True,input=bytes(data),capture_output=True,timeout=15,env=self.env)
                 if proc.stdout: channel.sendall(proc.stdout)
                 if proc.stderr: channel.sendall_stderr(proc.stderr)
                 channel.send_exit_status(proc.returncode)
