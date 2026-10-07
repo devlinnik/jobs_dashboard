@@ -20,6 +20,17 @@ def desktop_self_test(output=None):
     """Check the packaged backend/assets in an isolated data directory without opening a GUI."""
     result = {'ok': False}
     try:
+        from dashboard.desktop import ASSETS
+        if not (ASSETS / 'devlin-desk.ico').read_bytes().startswith(b'\x00\x00\x01\x00'):
+            raise RuntimeError('Missing or invalid Windows icon')
+        if not (ASSETS / 'devlin-desk.png').read_bytes().startswith(b'\x89PNG\r\n\x1a\n'):
+            raise RuntimeError('Missing or invalid icon source')
+        if sys.platform == 'win32':
+            # Validate bundled tray dependencies without creating a notification icon.
+            import pystray
+            from PIL import Image
+            with Image.open(ASSETS / 'devlin-desk.ico') as icon:
+                icon.load()
         with tempfile.TemporaryDirectory(prefix='devlin-self-test-') as directory:
             with socket.socket() as sock:
                 sock.bind(('127.0.0.1', 0))
@@ -50,7 +61,10 @@ def desktop_self_test(output=None):
                         body = response.read()
                         if response.status != 200 or expected not in body:
                             raise RuntimeError('Missing or invalid packaged asset: ' + path)
-                result = {'ok': True, 'checks': ['local-api', 'isolated-data', 'html', 'javascript', 'css']}
+                checks = ['local-api', 'isolated-data', 'html', 'javascript', 'css', 'application-icons']
+                if sys.platform == 'win32':
+                    checks.append('tray-dependencies')
+                result = {'ok': True, 'checks': checks}
             finally:
                 server.should_exit = True
                 thread.join()
@@ -73,6 +87,10 @@ def main():
     parser.add_argument('--self-test', action='store_true', help='Проверить сборку без GUI и пользовательских данных')
     parser.add_argument('--self-test-output', type=Path, help='Новый JSON-файл результата проверки')
     args = parser.parse_args()
+    if sys.platform == 'win32':
+        # Stable taskbar identity, independent of the Python build interpreter.
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Devlin.DevlinDesk')
     if args.self_test:
         if not desktop_self_test(args.self_test_output):
             raise RuntimeError('Проверка сборки не прошла')
@@ -127,8 +145,18 @@ def main():
                 import webview
             except ImportError:
                 raise RuntimeError('Установите requirements-desktop.txt или запустите python run.py --browser')
-            webview.create_window('Devlin Desk', url, width=1440, height=920, min_size=(1000, 700))
-            webview.start()
+            window = webview.create_window('Devlin Desk', url, width=1440, height=920, min_size=(1000, 700))
+            if sys.platform == 'win32':
+                from dashboard.desktop import DesktopTray, ASSETS
+                tray = DesktopTray(window, app.state.store)
+                window.events.closing += tray.closing
+                try:
+                    # Set up the tray after the native window exists.
+                    webview.start(tray.start, icon=str(ASSETS / 'devlin-desk.ico'))
+                finally:
+                    tray.close()
+            else:
+                webview.start()
     except KeyboardInterrupt:
         pass
     finally:

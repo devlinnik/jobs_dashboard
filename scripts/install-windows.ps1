@@ -105,7 +105,8 @@ try {
         if (Test-Path (Join-Path $sourceCandidate "run.py")) {
             $SourceDirectory = $sourceCandidate
         } else {
-            $manifest = Join-Path $sourceCandidate "install-info.json"
+            $manifest = Join-Path $sourceCandidate "maintenance\install-info.json"
+            if (-not (Test-Path $manifest)) { $manifest = Join-Path $sourceCandidate "install-info.json" }
             if (Test-Path $manifest) {
                 $SourceDirectory = (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).source_directory
             }

@@ -5,6 +5,6 @@ foreach ($process in @(Get-Process -Name DevlinDesk -ErrorAction SilentlyContinu
     $path = $null
     try { $path = $process.Path } catch { }
     if (-not $path -or [string]::Equals($path, $expected, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Close Devlin Desk before installation/update and try again. Processes are not terminated automatically."
+        throw "Exit Devlin Desk using the tray menu before installation/update and try again. Closing the window keeps monitoring in the background. Processes are not terminated automatically."
     }
 }

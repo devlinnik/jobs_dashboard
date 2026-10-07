@@ -19,7 +19,7 @@ class InstanceLock:
                 fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             self.file.close()
-            raise RuntimeError('Devlin Desk уже запущен с этим каталогом данных. Откройте существующее окно.') from exc
+            raise RuntimeError('Devlin Desk уже запущен с этим каталогом данных. Откройте окно через значок в системном трее; для завершения выберите «Выход» в его меню.') from exc
 
     def close(self):
         if not self.file.closed:

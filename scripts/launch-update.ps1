@@ -10,7 +10,8 @@ try {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $temporary $name)
     }
     $arguments = @{ Action = "Update"; TargetDirectory = $TargetDirectory }
-    $manifest = Join-Path $TargetDirectory "install-info.json"
+    $manifest = Join-Path $TargetDirectory "maintenance\install-info.json"
+    if (-not (Test-Path $manifest)) { $manifest = Join-Path $TargetDirectory "install-info.json" }
     if (Test-Path $manifest) {
         $source = (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).source_directory
         if ($source -and (Test-Path (Join-Path $source "run.py"))) { $arguments.SourceDirectory = $source }

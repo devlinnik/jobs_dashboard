@@ -65,7 +65,10 @@ def build_workspace(build_root):
     except Exception:
         log = build_root / 'install-error.log'
         try:
-            log.write_text(traceback.format_exc(), encoding='utf-8')
+            # A parent handoff failure must not overwrite the child's real error.
+            with log.open('a', encoding='utf-8') as output:
+                output.write('\n--- ' + time.strftime('%Y-%m-%d %H:%M:%S') + ' ---\n')
+                output.write(traceback.format_exc())
             print(f'Installation diagnostic log: {log}', file=sys.stderr)
         except OSError:
             traceback.print_exc()
@@ -179,6 +182,7 @@ def download_sources(work):
 
 def validate_source(source):
     for name in ('run.py', 'requirements-desktop.txt', 'dashboard/static/index.html',
+                 'dashboard/assets/devlin-desk.ico', 'dashboard/assets/devlin-desk.png',
                  'scripts/install-windows.ps1', 'scripts/package_windows.py', 'scripts/check-running.ps1', 'scripts/launch-update.ps1'):
         if not (source / name).is_file():
             raise InstallError(f'Missing source file: {name}')
@@ -205,32 +209,46 @@ def build(source, root, work):
     run([python, '-m', 'pip', 'check'], cwd=source)
     print('Building DevlinDesk.exe...', flush=True)
     run([python, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed',
+         '--contents-directory', 'runtime', '--icon', source / 'dashboard/assets/devlin-desk.ico',
          '--name', 'DevlinDesk', '--distpath', work / 'dist', '--workpath', work / 'pyinstaller',
          '--specpath', work, '--add-data', str(source / 'dashboard/static') + os.pathsep + 'dashboard/static',
+         '--add-data', str(source / 'dashboard/assets') + os.pathsep + 'dashboard/assets',
+         '--hidden-import', 'pystray._win32',
          '--collect-all', 'webview', '--hidden-import', 'uvicorn.logging',
          '--hidden-import', 'uvicorn.loops.asyncio', '--hidden-import', 'uvicorn.protocols.http.h11_impl',
          '--hidden-import', 'uvicorn.lifespan.on', source / 'run.py'], cwd=source)
     release = work / 'dist/DevlinDesk'
-    if not (release / 'DevlinDesk.exe').is_file() or not (release / '_internal').is_dir():
+    if not (release / 'DevlinDesk.exe').is_file() or not (release / 'runtime').is_dir():
         raise InstallError('Build did not produce a complete executable folder.')
     return release
 
 
 def write_launchers(release, source, root, metadata):
-    maintenance = release / '_maintenance'
+    maintenance = release / 'maintenance'
     maintenance.mkdir()
     for name in ('install-windows.ps1', 'package_windows.py', 'check-running.ps1', 'launch-update.ps1'):
         shutil.copy2(source / 'scripts' / name, maintenance / name)
     (release / 'Update-Devlin.cmd').write_text('''@echo off
-start "Devlin Desk Update" powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0_maintenance\\launch-update.ps1" -TargetDirectory "%~dp0." %*
+start "Devlin Desk Update" powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0maintenance\\launch-update.ps1" -TargetDirectory "%~dp0." %*
 exit /b 0
 ''', encoding='ascii', newline='\r\n')
-    (release / 'Start-Devlin.cmd').write_text('''@echo off
-start "" /D "%~dp0." "%~dp0DevlinDesk.exe"
+    (release / 'README.txt').write_text('''Devlin Desk
+
+Start: DevlinDesk.exe (or the desktop shortcut).
+Closing the window hides it to the Windows notification area.
+Click the tray icon to open; right-click for project statuses and Exit.
+Exit stops monitoring. Close via Exit before updating.
+Update: Update-Devlin.cmd.
+
+runtime/     Python runtime, libraries, interface and application icon.
+maintenance/ Update tools and installation manifest. Do not edit these files.
+User data: %LOCALAPPDATA%\\DevlinDesk (not in this application folder).
+Backups: ../backups/ (previous releases, retained after updates).
+Move the entire DevlinDesk folder; runtime and maintenance are required.
 ''', encoding='ascii', newline='\r\n')
-    manifest = {'application': 'DevlinDesk', 'format': 1, 'source_directory': str(root.resolve()),
+    manifest = {'application': 'DevlinDesk', 'format': 2, 'source_directory': str(root.resolve()),
                 'repository': REPOSITORY, 'built_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), **metadata}
-    (release / 'install-info.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    (maintenance / 'install-info.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
 
 
 def verify_release(release, work):
@@ -262,6 +280,12 @@ def check_running(target, checker):
          '-File', checker, '-TargetDirectory', target])
 
 
+def updated_packager(source):
+    """A future release can change its build recipe as well as application code."""
+    recipe = source / 'scripts/package_windows.py'
+    return recipe if recipe.read_bytes() != Path(__file__).read_bytes() else None
+
+
 def known_installation(target):
     if not target.exists():
         return
@@ -269,13 +293,13 @@ def known_installation(target):
         raise InstallError('The installation destination is not a normal directory.')
     if not any(target.iterdir()):
         return
-    marker = target / 'install-info.json'
-    if marker.exists():
-        try:
-            if json.loads(marker.read_text(encoding='utf-8')).get('application') == 'DevlinDesk':
-                return
-        except (ValueError, OSError):
-            pass
+    for marker in (target / 'maintenance/install-info.json', target / 'install-info.json'):
+        if marker.exists():
+            try:
+                if json.loads(marker.read_text(encoding='utf-8')).get('application') == 'DevlinDesk':
+                    return
+            except (ValueError, OSError):
+                pass
     # Allow upgrading the original unmarked PyInstaller release from this project.
     if (target / 'DevlinDesk.exe').is_file() and (target / '_internal').is_dir():
         return
@@ -299,7 +323,11 @@ def promote(release, target, verify, before_replace=lambda: None):
         # Recheck after a potentially long copy/test and before touching the old folder.
         known_installation(target)
         if target.exists():
-            backup = target.parent / (target.name + '.previous-' + time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
+            backups = target.parent / 'backups'
+            if backups.is_symlink():
+                raise InstallError('The backups directory must not be a symbolic link.')
+            backups.mkdir(exist_ok=True)
+            backup = backups / (target.name + '-' + time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
             retry_windows_lock(lambda: target.rename(backup), f'Preserving previous application at {backup}')
         try:
             retry_windows_lock(lambda: prepared.rename(target), f'Installing application at {target}')
@@ -318,8 +346,15 @@ def main():
     parser.add_argument('--source-root', type=Path, required=True)
     parser.add_argument('--target-folder', type=Path, required=True)
     parser.add_argument('--refresh', action='store_true')
+    parser.add_argument('--build-source', type=Path,
+                        help='Already prepared source directory (used when handing off to an updated packager)')
+    parser.add_argument('--build-metadata', type=Path)
     parser.add_argument('--result', type=Path, required=True)
     args = parser.parse_args()
+    if args.refresh and args.build_source:
+        raise InstallError('Prepared sources cannot also be refreshed.')
+    if args.build_metadata and not args.build_source:
+        raise InstallError('Prepared source metadata requires a prepared source directory.')
     if os.name != 'nt':
         raise InstallError('Native .exe packaging must run on Windows.')
     root, target = args.source_root.resolve(), args.target_folder.resolve()
@@ -333,9 +368,16 @@ def main():
     # A stale report cannot claim that a failed build succeeded.
     if args.result.exists():
         args.result.unlink()
-    with FileLock(build_root / "install.lock"), FileLock(target.parent / (".DevlinDesk-install-" + target.name + ".lock")):
-        with build_workspace(build_root) as work:
-            source, metadata = root, {'method': 'local'}
+    # Keep downloaded sources alive through a handoff, but release both locks before
+    # the updated coordinator acquires them. It performs all preflight checks again.
+    with build_workspace(build_root) as work:
+        handoff = None
+        with FileLock(build_root / "install.lock"), FileLock(target.parent / (".DevlinDesk-install-" + target.name + ".lock")):
+            source, metadata = args.build_source or root, {'method': 'local'}
+            if args.build_metadata:
+                metadata = json.loads(args.build_metadata.read_text(encoding='utf-8'))
+                if not isinstance(metadata, dict):
+                    raise InstallError('Invalid prepared source metadata.')
             if args.refresh:
                 if (root / '.git').exists():
                     refresh_git(root)
@@ -347,15 +389,25 @@ def main():
                 metadata['dirty'] = bool(git_output(source, 'status', '--porcelain', '--untracked-files=all'))
             checker = source / 'scripts/check-running.ps1'
             check_running(target, checker)
-            release = build(source, root, work)
-            write_launchers(release, source, root, metadata)
-            backup = promote(release, target, lambda folder: verify_release(folder, work),
-                             lambda: check_running(target, checker))
-            result = {'ok': True, 'executable': str(target / 'DevlinDesk.exe'), 'backup': str(backup) if backup else None}
-            args.result.write_text(json.dumps(result, indent=2), encoding='utf-8')
-            print('Application installed:', result['executable'], flush=True)
-            if backup:
-                print('Previous version preserved:', backup, flush=True)
+            recipe = updated_packager(source) if args.refresh else None
+            if recipe:
+                metadata_path = work / 'source-metadata.json'
+                metadata_path.write_text(json.dumps(metadata), encoding='utf-8')
+                handoff = [sys.executable, recipe, '--source-root', root, '--target-folder', target,
+                           '--build-source', source, '--build-metadata', metadata_path, '--result', args.result]
+            else:
+                release = build(source, root, work)
+                write_launchers(release, source, root, metadata)
+                backup = promote(release, target, lambda folder: verify_release(folder, work),
+                                 lambda: check_running(target, checker))
+                result = {'ok': True, 'executable': str(target / 'DevlinDesk.exe'), 'backup': str(backup) if backup else None}
+                args.result.write_text(json.dumps(result, indent=2), encoding='utf-8')
+                print('Application installed:', result['executable'], flush=True)
+                if backup:
+                    print('Previous version preserved:', backup, flush=True)
+        if handoff:
+            print('Build recipe updated: using the new packaging coordinator...', flush=True)
+            run(handoff)
 
 
 if __name__ == '__main__':

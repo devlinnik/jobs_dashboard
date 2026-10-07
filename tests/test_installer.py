@@ -3,7 +3,9 @@ import os
 import stat
 import subprocess
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 import pytest
 from scripts import package_windows as installer
 
@@ -126,6 +128,7 @@ def test_replace_verified_release_keeps_backup_and_user_data(tmp_path):
     assert calls==['new']
     assert (old/'DevlinDesk.exe').read_text()=='new'
     assert (backup/'DevlinDesk.exe').read_text()=='old'
+    assert backup.parent == old.parent/'backups'
     assert (userdata/'vault.key').read_bytes()==b'never-touch-vault'
     assert (userdata/'desk.sqlite3').read_bytes()==b'never-touch-settings'
     # Existing rollback releases are retained on a later update, never overwritten.
@@ -145,7 +148,7 @@ def test_preflight_failure_never_replaces_old_release(tmp_path,failure):
                           lambda: reject() if failure=='running' else None)
     assert (old/'DevlinDesk.exe').read_text()=='old'
     assert not list(old.parent.glob('.DevlinDesk-staging-*'))
-    assert not list(old.parent.glob('DevlinDesk.previous-*'))
+    assert not (old.parent/'backups').exists()
 
 
 def test_failed_final_rename_restores_the_previous_release(tmp_path,monkeypatch):
@@ -168,6 +171,22 @@ def test_unrelated_destination_is_not_overwritten(tmp_path):
     with pytest.raises(installer.InstallError,match='unrelated'):
         installer.promote(new,target,lambda folder:None)
     assert (target/'document.txt').read_text()=='preserve'
+
+
+def test_legacy_installation_upgrades_to_clean_layout(tmp_path):
+    old = release_at(tmp_path/'dist/DevlinDesk', 'old')
+    (old/'_maintenance').mkdir()
+    new = tmp_path/'release'
+    new.mkdir()
+    (new/'DevlinDesk.exe').write_text('new')
+    (new/'runtime').mkdir()
+    (new/'maintenance').mkdir()
+    (new/'maintenance/install-info.json').write_text(json.dumps({'application': 'DevlinDesk', 'format': 2}))
+    backup = installer.promote(new, old, lambda folder: installer.known_installation(folder))
+    assert (old/'runtime').is_dir() and (old/'maintenance').is_dir()
+    assert not (old/'_internal').exists() and not (old/'_maintenance').exists()
+    assert not (old/'install-info.json').exists()
+    assert (backup/'_internal').is_dir() and (backup/'_maintenance').is_dir()
 
 
 @pytest.mark.parametrize('name',['../escape.txt','/absolute.txt','root/../../escape.txt','C:/escape.txt','root\\escape.txt'])
@@ -195,13 +214,16 @@ def test_updater_bundle_is_self_contained_and_records_source_root(tmp_path):
     release=release_at(tmp_path/'release','new')
     installer.write_launchers(release,source,source,{'method':'local','commit':'abc'})
     for name in ('install-windows.ps1','package_windows.py','check-running.ps1','launch-update.ps1'):
-        assert (release/'_maintenance'/name).is_file()
+        assert (release/'maintenance'/name).is_file()
     launcher=(release/'Update-Devlin.cmd').read_text()
     assert 'start "Devlin Desk Update" powershell.exe' in launcher
     assert 'launch-update.ps1' in launcher
     assert 'pause' not in launcher  # original batch exits before its directory is replaced
-    metadata=json.loads((release/'install-info.json').read_text())
+    metadata=json.loads((release/'maintenance/install-info.json').read_text())
     assert metadata['source_directory']==str(source) and metadata['commit']=='abc'
+    assert metadata['format'] == 2
+    assert not (release/'Start-Devlin.cmd').exists()
+    assert (release/'README.txt').is_file()
 
 
 def test_installer_lock_blocks_a_second_update(tmp_path):
@@ -252,6 +274,57 @@ def test_git_refresh_refuses_divergent_history(tmp_path,monkeypatch):
     monkeypatch.setattr(installer,'run',fake_run)
     with pytest.raises(installer.InstallError,match='fast-forward'): installer.refresh_git(root)
     assert all('reset' not in args for args in commands)
+
+
+def test_updater_detects_changed_build_recipe(tmp_path):
+    scripts = tmp_path/'scripts'
+    scripts.mkdir()
+    recipe = scripts/'package_windows.py'
+    recipe.write_bytes(Path(installer.__file__).read_bytes())
+    assert installer.updated_packager(tmp_path) is None
+    recipe.write_bytes(recipe.read_bytes() + b'\n# newer build recipe\n')
+    assert installer.updated_packager(tmp_path) == recipe
+
+
+def test_updated_recipe_handoff_releases_locks_and_keeps_sources_alive(tmp_path, monkeypatch):
+    root = tmp_path/'root'
+    root.mkdir()
+    target = tmp_path/'dist/DevlinDesk'
+    result = tmp_path/'result.json'
+    source = root/'downloaded'
+    (source/'scripts').mkdir(parents=True)
+    recipe = source/'scripts/package_windows.py'
+    recipe.write_text('# changed build recipe')
+    held = []
+    @contextmanager
+    def lock(path):
+        held.append(path)
+        try:
+            yield
+        finally:
+            held.remove(path)
+    monkeypatch.setattr(installer, 'os', SimpleNamespace(name='nt'))
+    monkeypatch.setattr(installer, 'FileLock', lock)
+    monkeypatch.setattr(installer, 'validate_source', lambda path: None)
+    monkeypatch.setattr(installer, 'check_running', lambda *args: None)
+    monkeypatch.setattr(installer, 'download_sources', lambda work: (source, {'method': 'github-archive', 'archive_sha256': 'digest'}))
+    monkeypatch.setattr(installer.shutil, 'which', lambda name: None)
+    monkeypatch.setattr(installer.sys, 'argv', ['package_windows.py', '--source-root', str(root),
+                        '--target-folder', str(target), '--result', str(result), '--refresh'])
+    commands = []
+    def handoff(args, **kwargs):
+        commands.append(args)
+        assert held == []
+        metadata_path = Path(args[args.index('--build-metadata') + 1])
+        assert json.loads(metadata_path.read_text())['archive_sha256'] == 'digest'
+        assert metadata_path.parent.exists() and source.exists()
+        assert '--refresh' not in args
+        result.write_text(json.dumps({'ok': True}))
+    monkeypatch.setattr(installer, 'run', handoff)
+    installer.main()
+    assert len(commands) == 1 and commands[0][1] == recipe
+    assert json.loads(result.read_text())['ok']
+    assert not list((root/'.build').glob('release-*'))
 
 
 def test_packaged_verifier_rejects_missing_or_false_report(tmp_path,monkeypatch):
