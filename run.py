@@ -59,17 +59,21 @@ def desktop_self_test(output=None):
                     raise RuntimeError('Self-test server did not start')
                 if session.get('pin_enabled') is not False or session.get('authenticated') is not False:
                     raise RuntimeError('Self-test did not use isolated application data')
-                for path, expected in [('/', b'Devlin Desk'), ('/static/app.js', b'loadProjects'), ('/static/styles.css', b'--mint')]:
+                for path, markers in [('/', (b'Devlin Desk', b'ssh-profiles-page', b'ssh_profile_id', b'remote-browser-dialog')),
+                                      ('/static/app.js', (b'loadProjects', b'/ssh-profiles/${profileId}/directories', b'/app-info')),
+                                      ('/static/styles.css', (b'--mint',))]:
                     with local.open(base + path, timeout=5) as response:
                         body = response.read()
-                        if response.status != 200 or expected not in body:
+                        if response.status != 200 or any(marker not in body for marker in markers):
                             raise RuntimeError('Missing or invalid packaged asset: ' + path)
-                checks = ['local-api', 'isolated-data', 'html', 'javascript', 'css', 'application-icons']
+                from dashboard.version import app_info
+                info = app_info()
+                checks = ['local-api', 'isolated-data', 'html', 'javascript', 'css', 'application-icons', 'ssh-profile-interface']
                 if sys.platform == 'win32':
                     checks.append('tray-dependencies')
                     if getattr(sys, 'frozen', False):
                         checks.append('embedded-exe-icon')
-                result = {'ok': True, 'checks': checks}
+                result = {'ok': True, 'checks': checks, 'version': info['version'], 'commit': info.get('commit', '')}
             finally:
                 server.should_exit = True
                 thread.join()

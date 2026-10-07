@@ -17,6 +17,7 @@ from .models import ProjectInput, SettingsInput, SyncInput, InitInput, SSHProfil
 from .remote import connect, inspect_host, RemoteError
 from .monitor import Monitor, probe_script
 from . import gitops
+from .version import app_info
 
 STATIC = Path(__file__).parent / 'static'
 
@@ -99,7 +100,7 @@ def create_app(directory=None, start_monitor=True):
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['Referrer-Policy'] = 'no-referrer'
         response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
-        if request.url.path.startswith('/api/'):
+        if request.url.path == '/' or request.url.path.startswith(('/api/', '/static/')):
             response.headers['Cache-Control'] = 'no-store'
         return response
 
@@ -126,7 +127,11 @@ def create_app(directory=None, start_monitor=True):
     @app.get('/api/session')
     def session(request: Request):
         return {'authenticated': sessions.valid(request.cookies.get('desk_session')),
-                'pin_enabled': bool(store.settings()['pin_hash']), 'version': '1.0.0'}
+                'pin_enabled': bool(store.settings()['pin_hash']), 'version': app_info()['version']}
+
+    @app.get('/api/app-info', dependencies=auth)
+    def application_info():
+        return app_info()
 
     @app.post('/api/unlock')
     def unlock(body: UnlockInput, response: Response):
@@ -345,6 +350,14 @@ def create_app(directory=None, start_monitor=True):
             with connect(store, profile, require_project=False):
                 return {'ok': True, 'message': 'SSH-профиль подключён. Теперь выберите папку для проекта.'}
         return await asyncio.to_thread(test)
+
+    @app.get('/api/ssh-profiles/{profile_id}/directories', dependencies=auth)
+    async def profile_directories(profile_id: str, path: str = Query(default='', max_length=1024)):
+        profile = store.profile(profile_id) | {'ssh_path': ''}
+        def browse():
+            with connect(store, profile, require_project=False) as conn:
+                return conn.directories(path)
+        return await asyncio.to_thread(browse)
 
     @app.get('/api/projects/{pid}/git', dependencies=auth)
     async def git_status(pid: str):

@@ -10,6 +10,26 @@ import pytest
 from scripts import package_windows as installer
 
 
+def test_packager_ships_release_identity_with_frontend(tmp_path, monkeypatch):
+    source = Path(__file__).resolve().parents[1]
+    work = tmp_path / 'work'; work.mkdir()
+    calls = []
+    monkeypatch.setattr(installer, 'ensure_build_python', lambda root: Path('python.exe'))
+    def run(args, **kwargs):
+        calls.append([str(arg) for arg in args])
+        if 'PyInstaller' in args:
+            release = work / 'dist/DevlinDesk'
+            (release / 'runtime').mkdir(parents=True)
+            (release / 'DevlinDesk.exe').write_bytes(b'fake exe')
+    monkeypatch.setattr(installer, 'run', run)
+    installer.build(source, tmp_path, work, {'commit': 'verified-source', 'dirty': False})
+    command = calls[-1]
+    assert str(source / 'dashboard/version.json') + os.pathsep + 'dashboard' in command
+    assert str(work / 'build-info.json') + os.pathsep + 'dashboard' in command
+    info = json.loads((work / 'build-info.json').read_text())
+    assert info['commit'] == 'verified-source' and info['dirty'] is False and info['built_at']
+
+
 def windows_access_error():
     error = PermissionError('simulated Windows access denial')
     error.winerror = 5

@@ -63,7 +63,9 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            page.locator('[data-nav=settings]').click()
+            expect(page.locator('#app-version')).to_have_text('v1.3.0')
+            page.locator('[data-nav=ssh-profiles]').click()
+            expect(page.locator('#ssh-profiles-page')).to_be_visible()
             page.locator('#new-ssh-profile').click()
             profile_form = page.locator('#ssh-profile-form')
             profile_form.locator('[name=name]').fill('Общий сервер')
@@ -89,6 +91,14 @@ def main():
             form.locator('[name=description]').fill('Интеграционный тест: HTTP, SSH и Git')
             form.locator('[name=notify]').uncheck()
             form.locator('[name=ssh_profile_id]').select_option(label='Общий сервер')
+            expect(page.locator('#individual-ssh-fields')).not_to_be_visible()
+            page.locator('#ssh-browse').click()
+            expect(page.locator('#remote-path')).to_have_value(str(temp), timeout=20000)
+            page.locator(f'#remote-folders [data-remote-path="{server_files}"]').click(timeout=20000)
+            expect(page.locator('#remote-path')).to_have_value(str(server_files), timeout=20000)
+            page.locator('#remote-select').click()
+            expect(form.locator('[name=ssh_path]')).to_have_value(str(server_files))
+            assert page.evaluate("fetch('/api/projects').then(r=>r.json()).then(p=>p.length)") == 0
             form.locator('[name=git_branch]').fill('main')
             form.locator('button[type=submit]').click()
             expect(page.locator('#project-form-dialog')).not_to_be_visible()
@@ -109,7 +119,7 @@ def main():
             page.screenshot(path=str(screenshot/'ssh-browser.png'))
             page.locator('#remote-select').click()
             expect(form.locator('[name=ssh_path]')).to_have_value(str(server_files))
-            assert page.evaluate("fetch('/api/projects',{headers:{'X-App-Request':'1'}}).then(r=>r.json()).then(p=>p[0].ssh_path)") == ''
+            assert page.evaluate("fetch('/api/projects',{headers:{'X-App-Request':'1'}}).then(r=>r.json()).then(p=>p[0].ssh_path)") == str(server_files)
             form.locator('button[type=submit]').click()
             expect(page.locator('#project-form-dialog')).not_to_be_visible()
             page.locator('[data-detail-action=ssh-test]').click()
@@ -133,7 +143,11 @@ def main():
             page.locator('[data-git-action=commit]').click()
             expect(page.locator('#confirm-dialog')).to_be_visible()
             page.locator('#confirm-accept').click()
-            expect(page.get_by_text('Рабочая директория чистая. Изменений для коммита нет.')).to_be_visible(timeout=20000)
+            try:
+                expect(page.get_by_text('Рабочая директория чистая. Изменений для коммита нет.')).to_be_visible(timeout=20000)
+            except AssertionError:
+                print('Git import diagnostic:', page.locator('#detail-content').inner_text(), page.locator('#toast').inner_text())
+                raise
             assert subprocess.check_output(['git','-C',str(bare),'show','main:index.php']).decode() == '<?php echo "Initial";'
             (server_files/'index.php').write_text('<?php echo "Updated on server";')
             page.locator('[data-git-action=refresh]').click()

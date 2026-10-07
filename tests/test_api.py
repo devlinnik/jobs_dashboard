@@ -14,6 +14,19 @@ def unlock(client, pin=''):
     return client.post('/api/unlock', json={'pin': pin})
 
 
+def test_release_identity_and_uncached_frontend(tmp_path):
+    with client_for(tmp_path) as client:
+        assert client.get('/api/app-info').status_code == 401
+        assert client.get('/api/session').json()['version'] == '1.3.0'
+        unlock(client)
+        info = client.get('/api/app-info').json()
+        assert info['version'] == '1.3.0' and info['executable']
+        for path in ('/', '/static/app.js', '/static/styles.css'):
+            response = client.get(path)
+            assert response.status_code == 200
+            assert response.headers['cache-control'] == 'no-store'
+
+
 def test_crud_encryption_and_no_secret_leak(tmp_path):
     with client_for(tmp_path) as client:
         assert client.get('/api/projects').status_code == 401

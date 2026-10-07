@@ -25,10 +25,18 @@ def test_shared_profile_browsing_without_valid_project_path(tmp_path):
             'ssh_user': 'deploy', 'ssh_password': 'test-password'}).json()
         assert 'test-password' not in json.dumps(profile) and profile['has_password']
         assert 'ssh_password_enc' not in profile
+        profile_url = '/api/ssh-profiles/' + profile['id']
+        assert client.get(profile_url+'/directories').status_code == 409
+        key = client.get(profile_url+'/fingerprint').json()
+        assert client.post(profile_url+'/trust', json={'fingerprint': key['fingerprint']}).status_code == 200
+        listing = client.get(profile_url+'/directories').json()
+        assert listing['path'] == str(home)
+        assert client.get('/api/projects').json() == []  # Browse before creating any project.
+        assert client.get(profile_url+'/directories', params={'path': 'relative'}).status_code == 409
+        assert client.get(profile_url+'/directories', params={'path': str(home/'missing')}).status_code == 409
         p = client.post('/api/projects', json={'name': 'One', 'ssh_profile_id': profile['id'], 'ssh_path': str(home/'missing'),
             'git_monitor': False, 'notify': False}).json()
         prefix = '/api/projects/' + p['id']
-        assert client.get(prefix+'/ssh/directories').status_code == 409
         key = client.get('/api/ssh-profiles/'+profile['id']+'/fingerprint').json()
         assert client.post('/api/ssh-profiles/'+profile['id']+'/trust', json={'fingerprint': key['fingerprint']}).status_code == 200
         assert client.post('/api/ssh-profiles/'+profile['id']+'/test').json()['ok']
@@ -59,6 +67,7 @@ def test_shared_profile_browsing_without_valid_project_path(tmp_path):
         client.post('/api/lock')
         assert client.get(prefix+'/ssh/directories').status_code == 401
         assert client.get('/api/ssh-profiles').status_code == 401
+        assert client.get(profile_url+'/directories').status_code == 401
 
 
 def test_legacy_migration_is_backed_up_shared_and_idempotent(tmp_path):

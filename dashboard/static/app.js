@@ -31,7 +31,7 @@ const timeText = value => value ? new Date(value).toLocaleTimeString('ru-RU', {h
 const fullDate = value => value ? new Date(value).toLocaleString('ru-RU', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : 'Ещё не проверялся';
 const bytes = value => value == null ? '—' : value >= 1024 ** 3 ? (value / 1024 ** 3).toFixed(1) + ' ГБ' : (value / 1024 ** 2).toFixed(0) + ' МБ';
 let projects = [], settings = {}, page = 'projects', selectedId = null, activeTab = 'overview', gitData = null, loggedIn = false, loadingProjects = false, pinEnabled = false;
-let sshProfiles = [], remoteProjectId = null, remoteCurrent = '', remoteParent = null, remoteRequest = 0, probeProjectId = null;
+let sshProfiles = [], remoteProjectId = null, remoteProfileId = '', remoteEndpoint = '', remoteCurrent = '', remoteParent = null, remoteRequest = 0, probeProjectId = null;
 
 async function api(path, options = {}) {
   const opts = {credentials:'same-origin', ...options, headers:{'X-App-Request':'1', ...(options.body ? {'Content-Type':'application/json'} : {}), ...options.headers}};
@@ -125,10 +125,11 @@ async function loadProjects() {
 async function navigate(target) {
   page = target;
   $$('[data-nav]').forEach(b => b.classList.toggle('active', b.dataset.nav === target));
-  ['projects','events','settings'].forEach(name => $('#' + name + '-page').hidden = name !== target);
-  $('#breadcrumb-current').textContent = {projects:'Проекты',events:'Журнал событий',settings:'Настройки'}[target];
+  ['projects','events','settings','ssh-profiles'].forEach(name => $('#' + name + '-page').hidden = name !== target);
+  $('#breadcrumb-current').textContent = {projects:'Проекты',events:'Журнал событий',settings:'Настройки','ssh-profiles':'SSH-профили'}[target];
   if (target === 'events') await loadEvents();
   if (target === 'settings') await loadSettings();
+  if (target === 'ssh-profiles') await loadProfiles();
 }
 
 function openForm(id = null) {
@@ -136,6 +137,7 @@ function openForm(id = null) {
   const p = id ? projects.find(p => p.id === id) : null;
   form.elements.ssh_profile_id.innerHTML = '<option value="">Индивидуальное подключение</option>' + sshProfiles.map(profile => `<option value="${escape(profile.id)}">${escape(profile.name)}</option>`).join('');
   $('#project-form-title').textContent = p ? 'Настройки проекта' : 'Новый проект';
+  $('#individual-ssh-fields').open = Boolean(p?.ssh_host && !p.ssh_profile_id);
   form.elements.id.value = id || '';
   if (p) {
     Object.entries(p).forEach(([key, value]) => {
@@ -337,6 +339,10 @@ async function boot() {
     await api('/unlock', {method:'POST',body:{pin:''}});
   }
   loggedIn = true; $('#app-shell').hidden = false; $('#lock-screen').hidden = true;
+  const info = await api('/app-info');
+  $('#app-version').textContent = `v${info.version}`;
+  $('#app-build').textContent = info.commit ? `${info.commit.slice(0, 8)}${info.dirty ? ' · локальные изменения' : ''}` : 'Запуск из исходников';
+  $('#app-version').title = `Запущено: ${info.executable}${info.built_at ? '\nСборка: ' + info.built_at : ''}`;
   await loadProjects(); await navigate(page);
 }
 $('#unlock-form').addEventListener('submit', event => {
@@ -364,6 +370,8 @@ function updateDiskFields() {
 function updateProfileFields() {
   const form = $('#project-form'), profile = sshProfiles.find(p => p.id === form.elements.ssh_profile_id.value);
   ['ssh_host','ssh_port','ssh_user','ssh_key','ssh_password','clear_password'].forEach(k => form.elements[k].disabled = Boolean(profile));
+  $('#individual-ssh-fields').hidden = Boolean(profile);
+  $('#project-ssh-status').textContent = profile ? `${profile.ssh_user}@${profile.ssh_host}:${profile.ssh_port} · ${profile.ssh_fingerprint ? 'ключ подтверждён, папку можно выбрать через проводник' : 'сначала подтвердите ключ в разделе «SSH-профили»'}` : 'Выберите общий SSH-профиль. Он настраивается и проверяется в отдельном разделе панели.';
   if (profile) {
     ['ssh_host','ssh_port','ssh_user','ssh_key'].forEach(k => form.elements[k].value = profile[k] || '');
     form.elements.ssh_password.value = ''; form.elements.clear_password.checked = false;
@@ -377,14 +385,20 @@ $('#project-form [name=ssh_profile_id]').addEventListener('change', updateProfil
 
 async function openRemoteBrowser() {
   const form = $('#project-form'), id = form.elements.id.value, saved = projects.find(p => p.id === id);
-  if (!saved?.ssh_host) throw new Error('Сначала сохраните проект с SSH-профилем или SSH-хостом и пользователем. Путь можно оставить пустым.');
-  if (!saved.ssh_fingerprint) throw new Error('Сначала подтвердите ключ SSH-сервера в профиле или разделе «Обзор».');
-  if (form.elements.ssh_profile_id.value !== (saved.ssh_profile_id || '') ||
-      (!saved.ssh_profile_id && (['ssh_host','ssh_user','ssh_key'].some(k => form.elements[k].value.trim() !== (saved[k] || '')) ||
-      Number(form.elements.ssh_port.value) !== saved.ssh_port || form.elements.ssh_password.value || form.elements.clear_password.checked))) {
-    throw new Error('SSH-настройки изменены. Сначала сохраните проект; затем откройте проводник.');
+  const profileId = form.elements.ssh_profile_id.value, profile = sshProfiles.find(p => p.id === profileId);
+  if (profileId) {
+    if (!profile?.ssh_fingerprint) throw new Error('Подтвердите ключ выбранного профиля в разделе «SSH-профили», затем откройте проводник.');
+    remoteEndpoint = `/ssh-profiles/${profileId}/directories`;
+  } else {
+    if (!saved?.ssh_host) throw new Error('Выберите SSH-профиль или сохраните индивидуальные SSH-настройки проекта.');
+    if (!saved.ssh_fingerprint) throw new Error('Сначала подтвердите ключ SSH-сервера в разделе «Обзор».');
+    if (saved.ssh_profile_id || ['ssh_host','ssh_user','ssh_key'].some(k => form.elements[k].value.trim() !== (saved[k] || '')) ||
+        Number(form.elements.ssh_port.value) !== saved.ssh_port || form.elements.ssh_password.value || form.elements.clear_password.checked) {
+      throw new Error('Индивидуальные SSH-настройки изменены. Сначала сохраните проект.');
+    }
+    remoteEndpoint = `/projects/${id}/ssh/directories`;
   }
-  remoteProjectId = id; $('#remote-browser-dialog').showModal(); await loadRemoteFolders('');
+  remoteProjectId = id; remoteProfileId = profileId; $('#remote-browser-dialog').showModal(); await loadRemoteFolders('');
 }
 $('#ssh-browse').onclick = () => busy($('#ssh-browse'), openRemoteBrowser);
 async function loadRemoteFolders(path) {
@@ -396,7 +410,7 @@ async function loadRemoteFolders(path) {
   ['remote-home','remote-root','remote-up','remote-select'].forEach(id => $('#' + id).disabled = true);
   $('#remote-path-form button').disabled = true;
   try {
-    const data = await api(`/projects/${remoteProjectId}/ssh/directories?path=${encodeURIComponent(path)}`);
+    const data = await api(`${remoteEndpoint}?path=${encodeURIComponent(path)}`);
     if (sequence !== remoteRequest || !$('#remote-browser-dialog').open) return;
     remoteCurrent = data.path; remoteParent = data.parent; $('#remote-path').value = data.path;
     const crumbs = [{name:'/', path:'/'}]; let cumulative = '';
@@ -421,7 +435,7 @@ $('#remote-up').onclick = () => loadRemoteFolders(remoteParent || '/');
 $('#remote-path-form').onsubmit = event => { event.preventDefault(); loadRemoteFolders($('#remote-path').value.trim()); };
 ['remote-folders','remote-breadcrumbs'].forEach(id => $('#' + id).onclick = event => { const button = event.target.closest('[data-remote-path]'); if (button) loadRemoteFolders(button.dataset.remotePath); });
 $('#remote-select').onclick = () => {
-  if (!remoteCurrent || $('#project-form').elements.id.value !== remoteProjectId) return;
+  if (!remoteCurrent || $('#project-form').elements.id.value !== remoteProjectId || $('#project-form').elements.ssh_profile_id.value !== remoteProfileId) return;
   $('#project-form').elements.ssh_path.value = remoteCurrent; $('#remote-browser-dialog').close(); toast('Папка выбрана. Нажмите «Сохранить проект», чтобы применить путь.');
 };
 

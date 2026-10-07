@@ -203,17 +203,22 @@ def ensure_build_python(root):
     return python
 
 
-def build(source, root, work):
+def build(source, root, work, metadata=None):
     python = ensure_build_python(root)
     print('Installing/updating isolated build dependencies...', flush=True)
     run([python, '-m', 'pip', 'install', '-r', source / 'requirements-desktop.txt'], cwd=source)
     run([python, '-m', 'pip', 'check'], cwd=source)
     print('Building DevlinDesk.exe...', flush=True)
+    build_info = work / 'build-info.json'
+    build_info.write_text(json.dumps({**(metadata or {}),
+        'built_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}), encoding='utf-8')
     run([python, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed',
          '--contents-directory', 'runtime', '--icon', source / 'dashboard/assets/devlin-desk.ico',
          '--name', 'DevlinDesk', '--distpath', work / 'dist', '--workpath', work / 'pyinstaller',
          '--specpath', work, '--add-data', str(source / 'dashboard/static') + os.pathsep + 'dashboard/static',
          '--add-data', str(source / 'dashboard/assets') + os.pathsep + 'dashboard/assets',
+         '--add-data', str(source / 'dashboard/version.json') + os.pathsep + 'dashboard',
+         '--add-data', str(build_info) + os.pathsep + 'dashboard',
          '--hidden-import', 'pystray._win32',
          '--collect-all', 'webview', '--hidden-import', 'uvicorn.logging',
          '--hidden-import', 'uvicorn.loops.asyncio', '--hidden-import', 'uvicorn.protocols.http.h11_impl',
@@ -397,7 +402,7 @@ def main():
                 handoff = [sys.executable, recipe, '--source-root', root, '--target-folder', target,
                            '--build-source', source, '--build-metadata', metadata_path, '--result', args.result]
             else:
-                release = build(source, root, work)
+                release = build(source, root, work, metadata)
                 write_launchers(release, source, root, metadata)
                 backup = promote(release, target, lambda folder: verify_release(folder, work),
                                  lambda: check_running(target, checker))
