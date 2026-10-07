@@ -4,12 +4,12 @@ import struct
 from pathlib import Path
 
 
-def verify_icon_resources(ico, read_resource):
+def verify_icon_resources(ico, read_resource, group_identifier=1):
     data = Path(ico).read_bytes()
     reserved, kind, count = struct.unpack_from('<HHH', data)
     if reserved or kind != 1 or not count:
         raise RuntimeError('Invalid source ICO directory')
-    group = read_resource(14, 1)  # PyInstaller writes RT_GROUP_ICON number 1.
+    group = read_resource(14, group_identifier)  # PyInstaller: 1; C# compiler: 32512.
     if struct.unpack_from('<HHH', group) != (0, 1, count):
         raise RuntimeError('EXE icon group does not match application ICO')
     for index in range(count):
@@ -23,7 +23,7 @@ def verify_icon_resources(ico, read_resource):
             raise RuntimeError('EXE contains an outdated or different icon')
 
 
-def verify_executable_icon(executable, ico):
+def verify_executable_icon(executable, ico, group_identifier=1):
     from ctypes import wintypes
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel.LoadLibraryExW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD]
@@ -53,6 +53,6 @@ def verify_executable_icon(executable, ico):
             if not address or not size:
                 raise RuntimeError('Cannot read EXE icon resource')
             return ctypes.string_at(address, size)
-        verify_icon_resources(ico, read_resource)
+        verify_icon_resources(ico, read_resource, group_identifier)
     finally:
         kernel.FreeLibrary(module)

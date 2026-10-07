@@ -181,7 +181,7 @@ def download_sources(work):
 
 
 def validate_source(source):
-    for name in ('run.py', 'requirements-desktop.txt', 'dashboard/static/index.html',
+    for name in ('DevlinLauncher.exe', 'run.py', 'requirements-desktop.txt', 'dashboard/static/index.html',
                  'dashboard/assets/devlin-desk.ico', 'dashboard/assets/devlin-desk.png',
                  'scripts/refresh-icons.ps1',
                  'scripts/install-windows.ps1', 'scripts/package_windows.py', 'scripts/check-running.ps1', 'scripts/launch-update.ps1'):
@@ -234,17 +234,14 @@ def write_launchers(release, source, root, metadata):
     maintenance.mkdir()
     for name in ('install-windows.ps1', 'package_windows.py', 'check-running.ps1', 'launch-update.ps1', 'refresh-icons.ps1'):
         shutil.copy2(source / 'scripts' / name, maintenance / name)
-    (release / 'Update-Devlin.cmd').write_text('''@echo off
-start "Devlin Desk Update" powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0maintenance\\launch-update.ps1" -TargetDirectory "%~dp0." %*
-exit /b 0
-''', encoding='ascii', newline='\r\n')
+    shutil.copy2(source / 'DevlinLauncher.exe', release / 'DevlinLauncher.exe')
     (release / 'README.txt').write_text('''Devlin Desk
 
 Start: DevlinDesk.exe (or the desktop shortcut).
 Closing the window hides it to the Windows notification area.
 Click the tray icon to open; right-click for project statuses and Exit.
 Exit stops monitoring. Close via Exit before updating.
-Update: Update-Devlin.cmd.
+Install/update: DevlinLauncher.exe (live installation log).
 
 runtime/     Python runtime, libraries, interface and application icon.
 maintenance/ Update tools and installation manifest. Do not edit these files.
@@ -279,6 +276,20 @@ def verify_release(release, work):
         raise InstallError('The executable did not produce a readiness report.') from exc
     if result.get('ok') is not True:
         raise InstallError('The built executable failed its startup/asset check: ' + str(result.get('error', 'no details')))
+
+
+def verify_launcher(release, work):
+    report = work / ('launcher-test-' + uuid.uuid4().hex + '.json')
+    executable = release / 'DevlinLauncher.exe'
+    print(f'Checking standalone launcher: {executable}', flush=True)
+    retry_windows_lock(lambda: run([executable, '--self-test-output', report], timeout=60),
+                       f'Starting {executable}')
+    try:
+        result = json.loads(report.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError) as exc:
+        raise InstallError('The launcher did not produce a readiness report.') from exc
+    if result.get('ok') is not True or len(result.get('checks', [])) < 4:
+        raise InstallError('The launcher failed its process/resource check: ' + str(result.get('error', 'no details')))
 
 
 def check_running(target, checker):
@@ -404,6 +415,7 @@ def main():
             else:
                 release = build(source, root, work, metadata)
                 write_launchers(release, source, root, metadata)
+                verify_launcher(release, work)
                 backup = promote(release, target, lambda folder: verify_release(folder, work),
                                  lambda: check_running(target, checker))
                 result = {'ok': True, 'executable': str(target / 'DevlinDesk.exe'), 'backup': str(backup) if backup else None}

@@ -235,10 +235,8 @@ def test_updater_bundle_is_self_contained_and_records_source_root(tmp_path):
     installer.write_launchers(release,source,source,{'method':'local','commit':'abc'})
     for name in ('install-windows.ps1','package_windows.py','check-running.ps1','launch-update.ps1','refresh-icons.ps1'):
         assert (release/'maintenance'/name).is_file()
-    launcher=(release/'Update-Devlin.cmd').read_text()
-    assert 'start "Devlin Desk Update" powershell.exe' in launcher
-    assert 'launch-update.ps1' in launcher
-    assert 'pause' not in launcher  # original batch exits before its directory is replaced
+    assert (release/'DevlinLauncher.exe').read_bytes() == (source/'DevlinLauncher.exe').read_bytes()
+    assert not (release/'Update-Devlin.cmd').exists()
     metadata=json.loads((release/'maintenance/install-info.json').read_text())
     assert metadata['source_directory']==str(source) and metadata['commit']=='abc'
     assert metadata['format'] == 2
@@ -370,3 +368,20 @@ def test_native_self_test_does_not_use_or_change_user_data(tmp_path,monkeypatch)
     assert json.loads(report.read_text())['ok']
     assert (userdata/'vault.key').read_bytes()==b'private'
     assert (userdata/'desk.sqlite3').read_bytes()==b'private-settings'
+
+
+def test_launcher_check_rejects_missing_or_failed_reports(tmp_path, monkeypatch):
+    release = release_at(tmp_path / 'release', 'new')
+    monkeypatch.setattr(installer, 'run', lambda *args, **kwargs: None)
+    with pytest.raises(installer.InstallError, match='launcher did not produce'):
+        installer.verify_launcher(release, tmp_path)
+    def failed(args, **kwargs):
+        Path(args[-1]).write_text(json.dumps({'ok': False, 'checks': [], 'error': 'stdout lost'}))
+    monkeypatch.setattr(installer, 'run', failed)
+    with pytest.raises(installer.InstallError, match='stdout lost'):
+        installer.verify_launcher(release, tmp_path)
+    def good(args, **kwargs):
+        assert Path(args[0]).name == 'DevlinLauncher.exe'
+        Path(args[-1]).write_text(json.dumps({'ok': True, 'checks': ['resources', 'args', 'paths', 'process']}), encoding='utf-8-sig')
+    monkeypatch.setattr(installer, 'run', good)
+    installer.verify_launcher(release, tmp_path)

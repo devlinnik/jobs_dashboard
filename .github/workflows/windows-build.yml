@@ -9,6 +9,7 @@ on:
       - 'tests/**'
       - 'scripts/**'
       - '*.cmd'
+      - 'DevlinLauncher.exe'
       - 'run.py'
       - 'requirements*.txt'
       - '.github/workflows/windows-build.yml'
@@ -24,6 +25,11 @@ jobs:
           python-version: '3.12'
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt -r requirements-desktop.txt
+      - name: Check the executable shipped in the repository
+        run: python -m pytest -q tests/test_launcher.py
+      - name: Rebuild standalone launcher with Windows compiler
+        shell: cmd
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-launcher.ps1
       - name: Windows PowerShell installer checks
         shell: cmd
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-installer.ps1
@@ -45,3 +51,7 @@ jobs:
         with:
           name: DevlinDesk-Windows
           path: dist/DevlinDesk/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DevlinLauncher-Windows
+          path: DevlinLauncher.exe

@@ -7,7 +7,11 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-# Process-local execution policy is set by the .cmd wrappers; global policy is never changed.
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUNBUFFERED = "1"
+# Process-local execution policy is set by the launcher; global policy is never changed.
 # Downloaded prerequisite installers must have valid publisher signatures before execution.
 function Invoke-Checked {
     param([string]$Program, [string[]]$Arguments)
@@ -127,7 +131,7 @@ try {
     $resultPath = Join-Path ([IO.Path]::GetTempPath()) ("DevlinInstall-" + [guid]::NewGuid().ToString("N") + ".json")
     try {
         $arguments = @($packager, "--source-root", $SourceDirectory, "--target-folder", $TargetDirectory, "--result", $resultPath)
-        if ($Action -eq "Update" -and -not $Local) { $arguments += "--refresh" }
+        if (-not $Local -and ($Action -eq "Update" -or -not (Test-Path (Join-Path $SourceDirectory "run.py")))) { $arguments += "--refresh" }
         Invoke-Checked -Program $python -Arguments $arguments
         $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
         if (-not $result.ok) { throw "Installation did not report success." }

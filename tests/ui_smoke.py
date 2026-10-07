@@ -78,7 +78,7 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            expect(page.locator('#app-version')).to_have_text('v1.9.0')
+            expect(page.locator('#app-version')).to_have_text('v1.10.0')
             assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == 'light'
             assert page.evaluate("parseFloat(getComputedStyle(document.body).fontSize)") >= 16
             page.locator('[data-nav=ssh-profiles]').click()
