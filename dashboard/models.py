@@ -24,6 +24,7 @@ class ProjectInput(BaseModel):
     enabled: bool = True
     notify: bool = True
     ssh_host: str = Field(default='', max_length=253)
+    ssh_profile_id: str = Field(default='', max_length=100)
     ssh_port: int = Field(default=22, ge=1, le=65535)
     ssh_user: str = Field(default='', max_length=80)
     ssh_path: str = Field(default='', max_length=1024)
@@ -74,14 +75,33 @@ class ProjectInput(BaseModel):
 
     @model_validator(mode='after')
     def validate_connections(self):
-        if self.ssh_host and (not self.ssh_user or not self.ssh_path.startswith('/')):
-            raise ValueError('Для SSH нужны пользователь и абсолютный путь к проекту')
+        if self.ssh_host and not self.ssh_user:
+            raise ValueError('Для SSH нужен пользователь сервера')
+        if self.ssh_path and not self.ssh_path.startswith('/'):
+            raise ValueError('Путь к проекту должен быть абсолютным; либо оставьте его пустым и выберите через SSH-проводник')
         if self.ssh_host and not re.fullmatch(r'[a-zA-Z0-9_.:\-]+', self.ssh_host):
             raise ValueError('SSH-хост должен быть именем или IP, без протокола')
         if self.disk_mode not in ('ssh', 'http', 'off'):
             raise ValueError('Неизвестный способ проверки диска')
-        if self.auto_sync and not (self.ssh_host and self.git_monitor):
+        if self.auto_sync and not ((self.ssh_host or self.ssh_profile_id) and self.git_monitor):
             raise ValueError('Автосинхронизация требует SSH и мониторинга Git')
+        return self
+
+
+class SSHProfileInput(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    ssh_host: str = Field(min_length=1, max_length=253)
+    ssh_port: int = Field(default=22, ge=1, le=65535)
+    ssh_user: str = Field(min_length=1, max_length=80)
+    ssh_key: str = Field(default='', max_length=1024)
+    ssh_password: str | None = Field(default=None, max_length=2048)
+    clear_password: bool = False
+
+    @model_validator(mode='after')
+    def validate_connection(self):
+        clean = ProjectInput(name=self.name, ssh_host=self.ssh_host, ssh_port=self.ssh_port,
+                             ssh_user=self.ssh_user, ssh_key=self.ssh_key)
+        self.name, self.ssh_host, self.ssh_user, self.ssh_key = clean.name, clean.ssh_host, clean.ssh_user, clean.ssh_key
         return self
 
 

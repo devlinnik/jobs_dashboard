@@ -34,14 +34,41 @@ class TestServer(paramiko.ServerInterface):
         return True
 
 
+class ReadOnlySFTP(paramiko.SFTPServerInterface):
+    def __init__(self, server, *args, home=None, **kwargs):
+        super().__init__(server, *args, **kwargs)
+        self.home = home or os.getcwd()
+
+    def canonicalize(self, path):
+        return os.path.realpath(path if path.startswith('/') else os.path.join(self.home, path))
+
+    def stat(self, path):
+        try:
+            return paramiko.SFTPAttributes.from_stat(os.stat(self.canonicalize(path)))
+        except OSError as exc:
+            return paramiko.SFTPServer.convert_errno(exc.errno)
+
+    def list_folder(self, path):
+        try:
+            result = []
+            for name in os.listdir(self.canonicalize(path)):
+                entry = paramiko.SFTPAttributes.from_stat(os.lstat(os.path.join(self.canonicalize(path), name)))
+                entry.filename = name
+                result.append(entry)
+            return result
+        except OSError as exc:
+            return paramiko.SFTPServer.convert_errno(exc.errno)
+
+
 @contextmanager
-def ssh_server(env=None):
+def ssh_server(env=None, home=None):
     key = paramiko.RSAKey.generate(2048)
     listener = socket.socket(); listener.bind(('127.0.0.1',0)); listener.listen(); listener.settimeout(.2)
     port = listener.getsockname()[1]
     stopped = threading.Event(); transports = []
     def client(sock):
         transport = paramiko.Transport(sock); transports.append(transport); transport.add_server_key(key)
+        transport.set_subsystem_handler('sftp', paramiko.SFTPServer, ReadOnlySFTP, home=home)
         try:
             transport.start_server(server=TestServer(env))
             channels = []

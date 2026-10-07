@@ -85,8 +85,13 @@ class Monitor:
     def server_check(self, project):
         result = {}
         try:
-            with connect(self.store, project) as conn:
+            with connect(self.store, project, require_project=False) as conn:
                 result['ssh'] = {'ok': True}
+                try:
+                    result['directory'] = {'ok': True, 'path': conn.check_directory()}
+                except RemoteError as exc:
+                    result['directory'] = {'ok': False, 'error': str(exc)}
+                    return result
                 if project['disk_mode'] == 'ssh':
                     try:
                         result['disk'] = conn.disk()
@@ -132,8 +137,12 @@ class Monitor:
 
     async def disk_http(self, project):
         token = self.store.decrypt(project.get('disk_token_enc', ''))
-        if not project['disk_url'] or not token:
-            return {'error': 'Для HTTP-пробы нужны HTTPS URL и ключ'}
+        if not project['disk_url'] and not token:
+            return {'error': 'PHP-проба не настроена: установите её из карточки проекта, указав HTTPS URL. Или выберите проверку диска через SSH.'}
+        if not project['disk_url']:
+            return {'error': 'Ключ PHP-пробы сохранён, но HTTPS URL файла не указан. Заполните его в настройках проекта.'}
+        if not token:
+            return {'error': 'HTTPS URL указан, но ключ PHP-пробы отсутствует. Установите пробу из карточки проекта или укажите ключ существующей пробы.'}
         try:
             # Never forward the bearer token to a redirected destination.
             r = await self.http.get(project['disk_url'], headers={'Authorization': 'Bearer ' + token}, follow_redirects=False)
@@ -149,7 +158,7 @@ class Monitor:
     async def check(self, pid):
         lock = self.locks.setdefault(pid, asyncio.Lock())
         async with lock:
-            project = self.store.project(pid)
+            project = self.store.resolve_project(self.store.project(pid))
             previous = self.store.state(pid)
             state = {'checked_at': now()}
             if previous.get('pending_push'):
@@ -172,6 +181,8 @@ class Monitor:
                 issues.append('Сайт: ' + state['web']['error'])
             if state.get('ssh', {}).get('ok') is False:
                 issues.append('SSH: ' + state['ssh']['error'])
+            if state.get('directory', {}).get('ok') is False:
+                issues.append('Папка проекта: ' + state['directory']['error'])
             disk = state.get('disk', {})
             if disk.get('error'):
                 issues.append('Диск: ' + disk['error'])

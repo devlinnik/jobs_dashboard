@@ -31,6 +31,7 @@ const timeText = value => value ? new Date(value).toLocaleTimeString('ru-RU', {h
 const fullDate = value => value ? new Date(value).toLocaleString('ru-RU', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : 'Ещё не проверялся';
 const bytes = value => value == null ? '—' : value >= 1024 ** 3 ? (value / 1024 ** 3).toFixed(1) + ' ГБ' : (value / 1024 ** 2).toFixed(0) + ' МБ';
 let projects = [], settings = {}, page = 'projects', selectedId = null, activeTab = 'overview', gitData = null, loggedIn = false, loadingProjects = false, pinEnabled = false;
+let sshProfiles = [], remoteProjectId = null, remoteCurrent = '', remoteParent = null, remoteRequest = 0, probeProjectId = null;
 
 async function api(path, options = {}) {
   const opts = {credentials:'same-origin', ...options, headers:{'X-App-Request':'1', ...(options.body ? {'Content-Type':'application/json'} : {}), ...options.headers}};
@@ -117,7 +118,7 @@ async function loadProjects() {
   if (!loggedIn || loadingProjects) return;
   loadingProjects = true;
   try {
-    projects = await api('/projects'); renderProjects();
+    [projects, sshProfiles] = await Promise.all([api('/projects'), api('/ssh-profiles')]); renderProjects();
     if ($('#detail-dialog').open && activeTab === 'overview' && getProject()) renderOverview();
   } finally { loadingProjects = false; }
 }
@@ -133,6 +134,7 @@ async function navigate(target) {
 function openForm(id = null) {
   const form = $('#project-form'); form.reset();
   const p = id ? projects.find(p => p.id === id) : null;
+  form.elements.ssh_profile_id.innerHTML = '<option value="">Индивидуальное подключение</option>' + sshProfiles.map(profile => `<option value="${escape(profile.id)}">${escape(profile.name)}</option>`).join('');
   $('#project-form-title').textContent = p ? 'Настройки проекта' : 'Новый проект';
   form.elements.id.value = id || '';
   if (p) {
@@ -143,13 +145,15 @@ function openForm(id = null) {
     });
   }
   $('#ssh-password-hint').textContent = p?.has_password ? 'Пароль сохранён. Оставьте пустым, чтобы не менять.' : 'Хранится зашифрованным на вашем ПК.';
+  $('#disk-token-hint').textContent = p?.has_disk_token ? 'Ключ сохранён. Оставьте пустым, чтобы не менять.' : 'Ключ создаётся при установке PHP-пробы из карточки проекта.';
+  updateProfileFields(); updateDiskFields();
   $('#project-form-error').textContent = '';
   $('#project-form-dialog').showModal();
 }
 function formProject(form) {
   const data = Object.fromEntries(new FormData(form)); delete data.id;
   ['enabled','notify','clear_password','git_monitor','auto_sync','auto_push'].forEach(key => data[key] = form.elements[key].checked);
-  ['interval','ssh_port','disk_threshold'].forEach(key => data[key] = Number(data[key]));
+  ['interval','ssh_port','disk_threshold'].forEach(key => { if (data[key] !== undefined) data[key] = Number(data[key]); });
   if (!data.ssh_password) delete data.ssh_password;
   if (!data.disk_token) delete data.disk_token;
   return data;
@@ -190,7 +194,7 @@ function renderOverview() {
   const p = getProject(); if (!p) return;
   const state = p.state || {}, web = state.web || {}, disk = state.disk || {};
   const git = state.git || {};
-  $('#detail-content').innerHTML = `<div class="detail-topline"><div>${badge(p)}<p class="value-caption" style="margin-top:9px">${p.url ? `<a href="${escape(p.url)}" target="_blank" rel="noopener noreferrer">${escape(p.url)}</a>` : 'Адрес сайта не указан'}<br>Последняя проверка: ${fullDate(state.checked_at)}</p></div><button class="button primary" data-detail-action="check">${icon('refresh')}Проверить сейчас</button></div><div class="detail-grid"><section class="panel"><h3>ДОСТУПНОСТЬ САЙТА</h3><div class="big-value ${web.ok ? 'mint' : ''}">${web.code ? `HTTP ${web.code}` : web.ok === false ? 'Недоступен' : '—'}</div><p class="value-caption">${web.latency != null ? 'Ответ за ' + web.latency + ' мс' : p.url ? 'Ожидаем результат проверки' : 'Добавьте адрес сайта в настройках'}<br>Интервал: ${p.interval < 60 ? p.interval + ' сек.' : Math.round(p.interval / 60) + ' мин.'}</p></section><section class="panel"><h3>СВОБОДНОЕ МЕСТО НА СЕРВЕРЕ</h3><div class="big-value">${bytes(disk.free)} <span style="font-size:13px;color:var(--muted)">${disk.total ? 'из ' + bytes(disk.total) : ''}</span></div><p class="value-caption">${disk.free_percent != null ? 'Свободно ' + disk.free_percent + '% · ' + escape(disk.source) : escape(disk.error || 'Нет данных')}<br>Порог уведомления: ${p.disk_threshold}% свободного места</p>${disk.free_percent != null ? `<div class="disk-bar"><span style="width:${Math.max(0,Math.min(100,disk.free_percent))}%"></span></div>` : ''}</section></div>${state.issues?.length ? `<div class="issue-list">${state.issues.map(i=>`<p>${escape(i)}</p>`).join('')}</div>` : ''}<div class="detail-connection"><div><h3>SSH-подключение</h3><p>${p.ssh_host ? escape(`${p.ssh_user}@${p.ssh_host}:${p.ssh_port} · ${p.ssh_path}`) : 'Не настроено'}</p><p>${p.ssh_fingerprint ? 'Отпечаток подтверждён · ' + escape(p.ssh_fingerprint) : 'Отпечаток ещё не подтверждён'}</p></div><div class="detail-actions" style="margin:0">${p.ssh_host ? `<button class="button secondary small" data-detail-action="fingerprint">${icon('shield')}${p.ssh_fingerprint ? 'Проверить ключ' : 'Подтвердить ключ'}</button><button class="button secondary small" data-detail-action="ssh-test">${icon('terminal')}Тест SSH</button>` : '<button class="button secondary small" data-detail-action="edit">Настроить</button>'}</div></div><div class="detail-connection"><div><h3>Git на сервере</h3><p>${git.connected ? escape(git.branch + ' · ' + git.remote) : escape(git.error || 'Репозиторий не проверен или ещё не подключён')}</p><p>${p.auto_sync ? 'Автоматические коммиты включены' : 'Изменения принимаются вручную'}${p.auto_sync && p.auto_push ? ' · push в текущую ветку' : ''}</p></div><button class="button secondary small" data-detail-action="git">${icon('git')}Открыть Git</button></div><div class="detail-actions">${p.ssh_host ? `<button class="button secondary small" data-detail-action="deploy">${icon('disk')}Установить PHP-пробу</button>` : ''}<button class="button secondary small" data-detail-action="pause">${p.enabled ? 'Приостановить мониторинг' : 'Включить мониторинг'}</button><button class="danger-link" data-detail-action="delete">Удалить проект</button></div><p class="hint">HTTP-проба необязательна: по SSH место проверяется без установки файлов. Для пробы сервер должен выполнять PHP 8+ и передавать заголовок Authorization; HTTPS URL укажите в настройках.</p>`;
+  $('#detail-content').innerHTML = `<div class="detail-topline"><div>${badge(p)}<p class="value-caption" style="margin-top:9px">${p.url ? `<a href="${escape(p.url)}" target="_blank" rel="noopener noreferrer">${escape(p.url)}</a>` : 'Адрес сайта не указан'}<br>Последняя проверка: ${fullDate(state.checked_at)}</p></div><button class="button primary" data-detail-action="check">${icon('refresh')}Проверить сейчас</button></div><div class="detail-grid"><section class="panel"><h3>ДОСТУПНОСТЬ САЙТА</h3><div class="big-value ${web.ok ? 'mint' : ''}">${web.code ? `HTTP ${web.code}` : web.ok === false ? 'Недоступен' : '—'}</div><p class="value-caption">${web.latency != null ? 'Ответ за ' + web.latency + ' мс' : p.url ? 'Ожидаем результат проверки' : 'Добавьте адрес сайта в настройках'}<br>Интервал: ${p.interval < 60 ? p.interval + ' сек.' : Math.round(p.interval / 60) + ' мин.'}</p></section><section class="panel"><h3>СВОБОДНОЕ МЕСТО НА СЕРВЕРЕ</h3><div class="big-value">${bytes(disk.free)} <span style="font-size:13px;color:var(--muted)">${disk.total ? 'из ' + bytes(disk.total) : ''}</span></div><p class="value-caption">${disk.free_percent != null ? 'Свободно ' + disk.free_percent + '% · ' + escape(disk.source) : escape(disk.error || 'Нет данных')}<br>Порог уведомления: ${p.disk_threshold}% свободного места</p>${disk.free_percent != null ? `<div class="disk-bar"><span style="width:${Math.max(0,Math.min(100,disk.free_percent))}%"></span></div>` : ''}</section></div>${state.issues?.length ? `<div class="issue-list">${state.issues.map(i=>`<p>${escape(i)}</p>`).join('')}</div>` : ''}<div class="detail-connection"><div><h3>SSH-подключение</h3><p>${p.ssh_host ? escape(`${p.ssh_user}@${p.ssh_host}:${p.ssh_port} · ${p.ssh_path}`) : 'Не настроено'}</p><p>${p.ssh_fingerprint ? 'Отпечаток подтверждён · ' + escape(p.ssh_fingerprint) : 'Отпечаток ещё не подтверждён'}</p></div><div class="detail-actions" style="margin:0">${p.ssh_host ? `<button class="button secondary small" data-detail-action="fingerprint">${icon('shield')}${p.ssh_fingerprint ? 'Проверить ключ' : 'Подтвердить ключ'}</button><button class="button secondary small" data-detail-action="ssh-test">${icon('terminal')}Тест SSH</button><button class="button secondary small" data-detail-action="browse">${icon('folder')}Выбрать папку</button>` : '<button class="button secondary small" data-detail-action="edit">Настроить</button>'}</div></div><div class="detail-connection"><div><h3>Git на сервере</h3><p>${git.connected ? escape(git.branch + ' · ' + git.remote) : escape(git.error || 'Репозиторий не проверен или ещё не подключён')}</p><p>${p.auto_sync ? 'Автоматические коммиты включены' : 'Изменения принимаются вручную'}${p.auto_sync && p.auto_push ? ' · push в текущую ветку' : ''}</p></div><button class="button secondary small" data-detail-action="git">${icon('git')}Открыть Git</button></div><div class="detail-actions">${p.ssh_host ? `<button class="button secondary small" data-detail-action="deploy">${icon('disk')}Установить PHP-пробу</button>` : ''}<button class="button secondary small" data-detail-action="pause">${p.enabled ? 'Приостановить мониторинг' : 'Включить мониторинг'}</button><button class="danger-link" data-detail-action="delete">Удалить проект</button></div><p class="hint">HTTP-проба необязательна: по SSH место проверяется без установки файлов. Для пробы сервер должен выполнять PHP 8+ и передавать заголовок Authorization; HTTPS URL укажите в настройках.</p>`;
 }
 $('#detail-edit').onclick = () => openForm(selectedId);
 $$('[data-tab]').forEach(b => b.addEventListener('click', () => busy(b, async () => {activeTab = b.dataset.tab; await renderDetail();})));
@@ -205,17 +209,21 @@ async function detailAction(action) {
   if (action === 'check') {
     await api(`/projects/${id}/check`, {method:'POST'}); await loadProjects(); toast('Проверка завершена');
   }
-  if (action === 'ssh-test') { const result = await api(`/projects/${id}/ssh/test`, {method:'POST'}); toast(result.message); }
+  if (action === 'ssh-test') { const result = await api(`/projects/${id}/ssh/test`, {method:'POST'}); toast(result.message); if (result.directory?.ok === false) toast(result.directory.error, true); }
+  if (action === 'browse') { openForm(id); return openRemoteBrowser(); }
   if (action === 'fingerprint') {
     const key = await api(`/projects/${id}/ssh/fingerprint`);
-    const accepted = await confirmAction('Проверить ключ SSH-сервера', `Сверьте этот отпечаток с ключом сервера через панель хостинга или доверенный канал.\nСервер: ${key.host}:${key.port}\nАлгоритм: ${key.algorithm}\nПодтверждение закрепит ключ для следующих подключений.`, key.fingerprint);
+    const accepted = await confirmAction('Проверить ключ SSH-сервера', `Сверьте этот отпечаток с ключом сервера через панель хостинга или доверенный канал.\nСервер: ${key.host}:${key.port}\nАлгоритм: ${key.algorithm}\n${p.ssh_profile_id ? 'Подтверждение применяется ко всем проектам этого SSH-профиля.' : 'Подтверждение закрепит ключ для следующих подключений.'}`, key.fingerprint);
     if (accepted) { await api(`/projects/${id}/ssh/trust`, {method:'POST', body:{fingerprint:key.fingerprint}}); await loadProjects(); toast('Ключ сервера подтверждён'); }
   }
   if (action === 'deploy') {
-    if (!await confirmAction('Установить PHP-пробу?', `В ${p.ssh_path}/.devlin-disk.php будет добавлен файл для чтения объёма диска по HTTPS.\nСуществующий файл не перезаписывается. Проба возвращает только свободный и общий объём после проверки ключа.\nПродолжить установку?`)) return;
-    const result = await api(`/projects/${id}/disk/deploy`, {method:'POST', body:{confirm:true}});
-    await loadProjects();
-    await confirmAction('PHP-проба установлена', 'Ключ сохранён в приложении. Скопируйте его для внешних проверок сейчас — повторно он не показывается.\nЗатем укажите HTTPS URL файла и выберите проверку через PHP-пробу в настройках проекта.', result.token);
+    if (!p.ssh_path) throw new Error('Сначала выберите папку проекта через SSH-проводник.');
+    probeProjectId = id;
+    $('#probe-target').textContent = `Файл будет создан в ${p.ssh_path}/.devlin-disk.php. Укажите его адрес на сайте.`;
+    let suggested = p.disk_url || '';
+    if (!suggested && p.url?.startsWith('https://')) suggested = new URL('.devlin-disk.php', p.url).href;
+    $('#probe-url').value = suggested; $('#probe-setup-error').textContent = '';
+    $('#probe-setup-dialog').showModal();
   }
   if (action === 'pause') {
     const data = Object.fromEntries(Object.entries(p).filter(([k]) => !['id','state','has_password','has_disk_token','created_at','ssh_fingerprint'].includes(k)));
@@ -285,6 +293,7 @@ async function loadEvents() {
   $('#all-events').innerHTML = eventsHTML(await api('/events'));
 }
 async function loadSettings() {
+  await loadProfiles();
   settings = await api('/settings'); const form = $('#settings-form'); form.reset();
   Object.entries(settings).forEach(([key,value])=>{ const field = form.elements.namedItem(key); if (!field) return; if (field.type === 'checkbox') field.checked = Boolean(value); else field.value = value; });
   $('#bot-status').className = 'badge ' + (settings.telegram_configured ? 'good' : 'neutral');
@@ -347,6 +356,141 @@ $('#refresh-events').onclick = event => busy(event.currentTarget, loadEvents);
 $('#search').oninput = renderProjects; $('#status-filter').onchange = renderProjects;
 $('#project-list').onclick = event => { const button=event.target.closest('[data-open]'); if(button) busy(button,()=>openDetail(button.dataset.open)); };
 document.addEventListener('click', event => { const button=event.target.closest('[data-close]'); if(button) $('#'+button.dataset.close).close(); });
+function updateDiskFields() {
+  const form = $('#project-form'), http = form.elements.disk_mode.value === 'http';
+  $('#http-probe-fields').hidden = !http;
+  $('#disk-setup-hint').textContent = http ? 'Для PHP-пробы нужны адрес файла и ключ. Если пробы ещё нет, сохраните проект, затем установите её из раздела «Обзор».' : form.elements.disk_mode.value === 'ssh' ? 'Проверка через SSH не требует PHP-файла, HTTPS URL и ключа пробы.' : 'Проверка диска выключена.';
+}
+function updateProfileFields() {
+  const form = $('#project-form'), profile = sshProfiles.find(p => p.id === form.elements.ssh_profile_id.value);
+  ['ssh_host','ssh_port','ssh_user','ssh_key','ssh_password','clear_password'].forEach(k => form.elements[k].disabled = Boolean(profile));
+  if (profile) {
+    ['ssh_host','ssh_port','ssh_user','ssh_key'].forEach(k => form.elements[k].value = profile[k] || '');
+    form.elements.ssh_password.value = ''; form.elements.clear_password.checked = false;
+    $('#ssh-password-hint').textContent = 'Авторизация хранится в общем SSH-профиле. Изменяйте её в настройках профиля.';
+  } else if (projects.find(p => p.id === form.elements.id.value)?.ssh_profile_id) {
+    $('#ssh-password-hint').textContent = 'Для индивидуального подключения укажите пароль или используйте ключ/SSH-агент.';
+  }
+}
+$('#project-form [name=disk_mode]').addEventListener('change', updateDiskFields);
+$('#project-form [name=ssh_profile_id]').addEventListener('change', updateProfileFields);
+
+async function openRemoteBrowser() {
+  const form = $('#project-form'), id = form.elements.id.value, saved = projects.find(p => p.id === id);
+  if (!saved?.ssh_host) throw new Error('Сначала сохраните проект с SSH-профилем или SSH-хостом и пользователем. Путь можно оставить пустым.');
+  if (!saved.ssh_fingerprint) throw new Error('Сначала подтвердите ключ SSH-сервера в профиле или разделе «Обзор».');
+  if (form.elements.ssh_profile_id.value !== (saved.ssh_profile_id || '') ||
+      (!saved.ssh_profile_id && (['ssh_host','ssh_user','ssh_key'].some(k => form.elements[k].value.trim() !== (saved[k] || '')) ||
+      Number(form.elements.ssh_port.value) !== saved.ssh_port || form.elements.ssh_password.value || form.elements.clear_password.checked))) {
+    throw new Error('SSH-настройки изменены. Сначала сохраните проект; затем откройте проводник.');
+  }
+  remoteProjectId = id; $('#remote-browser-dialog').showModal(); await loadRemoteFolders('');
+}
+$('#ssh-browse').onclick = () => busy($('#ssh-browse'), openRemoteBrowser);
+async function loadRemoteFolders(path) {
+  const sequence = ++remoteRequest;
+  remoteCurrent = ''; remoteParent = null;
+  $('#remote-error').textContent = ''; $('#remote-list-hint').textContent = ''; $('#remote-breadcrumbs').innerHTML = '';
+  $('#remote-folders').innerHTML = '<div class="loading">Подключаемся к серверу и читаем папки…</div>';
+  $('#remote-path').value = path;
+  ['remote-home','remote-root','remote-up','remote-select'].forEach(id => $('#' + id).disabled = true);
+  $('#remote-path-form button').disabled = true;
+  try {
+    const data = await api(`/projects/${remoteProjectId}/ssh/directories?path=${encodeURIComponent(path)}`);
+    if (sequence !== remoteRequest || !$('#remote-browser-dialog').open) return;
+    remoteCurrent = data.path; remoteParent = data.parent; $('#remote-path').value = data.path;
+    const crumbs = [{name:'/', path:'/'}]; let cumulative = '';
+    data.path.split('/').filter(Boolean).forEach(name => { cumulative += '/' + name; crumbs.push({name, path:cumulative}); });
+    $('#remote-breadcrumbs').innerHTML = crumbs.map(c => `<button type="button" data-remote-path="${escape(c.path)}">${escape(c.name)}</button>`).join('<span>/</span>');
+    $('#remote-folders').innerHTML = data.directories.length ? data.directories.map(d => `<button type="button" class="remote-folder" data-remote-path="${escape(d.path)}">${icon('folder')}<span>${escape(d.name)}</span>${d.symlink ? '<small>ссылка</small>' : ''}</button>`).join('') : '<div class="events-empty">Вложенных папок нет. Можно выбрать текущую папку.</div>';
+    $('#remote-list-hint').textContent = data.truncated ? 'Показана часть папок. Нужный путь можно ввести сверху.' : 'Файлы не показаны. Ссылки открываются по их реальному пути.';
+  } catch (error) {
+    if (sequence !== remoteRequest || !$('#remote-browser-dialog').open) return;
+    $('#remote-error').textContent = error.message;
+    $('#remote-folders').innerHTML = '<div class="events-empty">Попробуйте домашнюю папку или укажите другой путь.</div>';
+  } finally {
+    if (sequence === remoteRequest && $('#remote-browser-dialog').open) {
+      ['remote-home','remote-root'].forEach(id => $('#' + id).disabled = false);
+      $('#remote-path-form button').disabled = false; $('#remote-up').disabled = !remoteParent; $('#remote-select').disabled = !remoteCurrent;
+    }
+  }
+}
+$('#remote-browser-dialog').addEventListener('close', () => { remoteRequest++; });
+$('#remote-home').onclick = () => loadRemoteFolders(''); $('#remote-root').onclick = () => loadRemoteFolders('/');
+$('#remote-up').onclick = () => loadRemoteFolders(remoteParent || '/');
+$('#remote-path-form').onsubmit = event => { event.preventDefault(); loadRemoteFolders($('#remote-path').value.trim()); };
+['remote-folders','remote-breadcrumbs'].forEach(id => $('#' + id).onclick = event => { const button = event.target.closest('[data-remote-path]'); if (button) loadRemoteFolders(button.dataset.remotePath); });
+$('#remote-select').onclick = () => {
+  if (!remoteCurrent || $('#project-form').elements.id.value !== remoteProjectId) return;
+  $('#project-form').elements.ssh_path.value = remoteCurrent; $('#remote-browser-dialog').close(); toast('Папка выбрана. Нажмите «Сохранить проект», чтобы применить путь.');
+};
+
+$('#probe-setup-form').onsubmit = async event => {
+  event.preventDefault(); const button = $('#probe-setup-form button[type=submit]'); if (button.disabled) return;
+  const url = $('#probe-url').value.trim();
+  if (!url.startsWith('https://')) { $('#probe-setup-error').textContent = 'Укажите HTTPS URL файла пробы.'; return; }
+  button.disabled = true; $('#probe-setup-error').textContent = '';
+  try {
+    const result = await api(`/projects/${probeProjectId}/disk/deploy`, {method:'POST', body:{confirm:true, disk_url:url}});
+    $('#probe-setup-dialog').close(); await loadProjects();
+    await confirmAction('PHP-проба установлена и настроена', 'HTTPS URL и ключ сохранены. Проверка через PHP-пробу включена.\nСкопируйте ключ сейчас, если он нужен для внешних проверок.', result.token);
+    toast('Проба настроена. Нажмите «Проверить сейчас».');
+  } catch (error) { $('#probe-setup-error').textContent = error.message; }
+  finally { button.disabled = false; }
+};
+
+async function loadProfiles() {
+  sshProfiles = await api('/ssh-profiles');
+  $('#ssh-profile-list').innerHTML = sshProfiles.length ? sshProfiles.map(p => `<article class="ssh-profile-row"><h3>${escape(p.name)}</h3><p>${escape(p.ssh_user)}@${escape(p.ssh_host)}:${p.ssh_port} · проектов: ${p.project_count}</p><p>${p.ssh_fingerprint ? 'Ключ подтверждён' : 'Ключ ещё не подтверждён'}</p><div class="detail-actions"><button class="button secondary small" data-profile-action="edit" data-profile-id="${p.id}">Настроить</button><button class="button secondary small" data-profile-action="trust" data-profile-id="${p.id}">Подтвердить ключ</button><button class="button secondary small" data-profile-action="test" data-profile-id="${p.id}">Тест SSH</button><button class="danger-link" data-profile-action="delete" data-profile-id="${p.id}">Удалить</button></div></article>`).join('') : '<p class="hint">Добавьте профиль, затем выберите его в проектах.</p>';
+}
+function openProfile(id = '') {
+  const form = $('#ssh-profile-form'), profile = sshProfiles.find(p => p.id === id); form.reset();
+  if (profile) Object.entries(profile).forEach(([key, value]) => { const field = form.elements.namedItem(key); if (field && field.type !== 'checkbox') field.value = value; });
+  $('#ssh-profile-error').textContent = ''; profileInfo(profile); $('#ssh-profile-dialog').showModal();
+}
+function profileInfo(profile) {
+  $('#ssh-profile-info').textContent = !profile ? 'Сохраните профиль, затем подтвердите ключ сервера и проверьте SSH.' : profile.ssh_fingerprint ? 'Ключ подтверждён для всех проектов этого профиля: ' + profile.ssh_fingerprint : 'Профиль сохранён. Подтвердите ключ сервера и проверьте SSH.';
+  $('#ssh-profile-trust').disabled = !profile; $('#ssh-profile-test').disabled = !profile;
+}
+$('#new-ssh-profile').onclick = () => openProfile(); $('#project-new-profile').onclick = () => openProfile();
+$('#ssh-profile-form').onsubmit = async event => {
+  event.preventDefault(); const form = event.currentTarget;
+  busy($('button[type=submit]', form), async () => {
+    $('#ssh-profile-error').textContent = ''; const id = form.elements.id.value, data = Object.fromEntries(new FormData(form)); delete data.id;
+    data.ssh_port = Number(data.ssh_port); data.clear_password = form.elements.clear_password.checked; if (!data.ssh_password) delete data.ssh_password;
+    try {
+      const profile = await api(id ? '/ssh-profiles/' + id : '/ssh-profiles', {method:id ? 'PUT' : 'POST', body:data});
+      form.elements.id.value = profile.id; form.elements.ssh_password.value = ''; form.elements.clear_password.checked = false;
+      await loadProfiles(); await loadProjects(); profileInfo(profile);
+      if ($('#project-form-dialog').open) {
+        const select = $('#project-form').elements.ssh_profile_id, selected = id ? select.value : profile.id;
+        select.innerHTML = '<option value="">Индивидуальное подключение</option>' + sshProfiles.map(p => `<option value="${p.id}">${escape(p.name)}</option>`).join('');
+        select.value = selected; updateProfileFields();
+      }
+      toast('SSH-профиль сохранён');
+    } catch (error) { $('#ssh-profile-error').textContent = error.message; }
+  });
+};
+async function profileAction(action, id) {
+  if (!id) throw new Error('Сначала сохраните SSH-профиль.');
+  if (action === 'edit') return openProfile(id);
+  if (action === 'trust') {
+    const key = await api(`/ssh-profiles/${id}/fingerprint`);
+    if (!await confirmAction('Подтвердить ключ SSH-профиля', `Сверьте отпечаток через панель хостинга или доверенный канал.\nСервер: ${key.host}:${key.port}\nАлгоритм: ${key.algorithm}\nПодтверждение применяется ко всем проектам этого профиля.`, key.fingerprint)) return;
+    await api(`/ssh-profiles/${id}/trust`, {method:'POST', body:{fingerprint:key.fingerprint}}); toast('Ключ SSH-профиля подтверждён');
+  }
+  if (action === 'test') toast((await api(`/ssh-profiles/${id}/test`, {method:'POST'})).message);
+  if (action === 'delete') {
+    if (!await confirmAction('Удалить SSH-профиль?', 'Удаление возможно только если профиль не используется проектами.')) return;
+    await api(`/ssh-profiles/${id}`, {method:'DELETE'});
+  }
+  await loadProfiles(); await loadProjects();
+  if ($('#ssh-profile-dialog').open) profileInfo(sshProfiles.find(p => p.id === id));
+}
+$('#ssh-profile-list').onclick = event => { const button = event.target.closest('[data-profile-action]'); if (button) busy(button, () => profileAction(button.dataset.profileAction, button.dataset.profileId)); };
+$('#ssh-profile-trust').onclick = event => busy(event.currentTarget, () => profileAction('trust', $('#ssh-profile-form').elements.id.value));
+$('#ssh-profile-test').onclick = event => busy(event.currentTarget, () => profileAction('test', $('#ssh-profile-form').elements.id.value));
+
 icons();
 boot().catch(error => { $('#lock-description').textContent = 'Не удалось подключиться: ' + error.message; });
 setInterval(()=> {if(loggedIn) loadProjects().catch(error=>toast(error.message,true));},15000);

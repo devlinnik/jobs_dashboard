@@ -7,13 +7,13 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
-from fastapi import FastAPI, Depends, HTTPException, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, Request, Response, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from .store import Store, now
 from .security import Sessions, hash_pin, verify_pin
-from .models import ProjectInput, SettingsInput, SyncInput, InitInput
+from .models import ProjectInput, SettingsInput, SyncInput, InitInput, SSHProfileInput, web_url
 from .remote import connect, inspect_host, RemoteError
 from .monitor import Monitor, probe_script
 from . import gitops
@@ -22,11 +22,18 @@ STATIC = Path(__file__).parent / 'static'
 
 
 def public_project(project, store):
+    project = store.resolve_project(project)
     result = {k: v for k, v in project.items() if not k.endswith('_enc')}
     result['has_password'] = bool(project.get('ssh_password_enc'))
     result['has_disk_token'] = bool(project.get('disk_token_enc'))
     result['state'] = store.state(project['id'])
     return result
+
+
+def public_profile(profile, store):
+    return {k: v for k, v in profile.items() if not k.endswith('_enc')} | {
+        'has_password': bool(profile.get('ssh_password_enc')),
+        'project_count': sum(p.get('ssh_profile_id') == profile['id'] for p in store.projects())}
 
 
 def public_settings(settings):
@@ -46,9 +53,19 @@ class ConfirmInput(BaseModel):
     confirm: bool = False
 
 
+class ProbeDeployInput(ConfirmInput):
+    disk_url: str = Field(default='', max_length=2048)
+
+    @field_validator('disk_url')
+    @classmethod
+    def validate_url(cls, value):
+        return web_url(value, https=True)
+
+
 def create_app(directory=None, start_monitor=True):
     store, sessions, locks = Store(directory), Sessions(), {}
     monitor = Monitor(store, locks)
+    profiles_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def lifespan(app):
@@ -141,6 +158,9 @@ def create_app(directory=None, start_monitor=True):
         data = body.model_dump(exclude={'ssh_password', 'disk_token', 'clear_password'})
         data.update(id=uuid.uuid4().hex, created_at=now(), ssh_fingerprint='',
                     ssh_password_enc=store.encrypt(body.ssh_password or ''), disk_token_enc=store.encrypt(body.disk_token or ''))
+        if data.get('ssh_profile_id'):
+            for key in ('ssh_host','ssh_user','ssh_key','ssh_password_enc','ssh_fingerprint'):
+                data[key] = ''
         store.save_project(data)
         monitor.due[data['id']] = 0
         store.event(data['id'], 'info', 'Проект добавлен')
@@ -151,9 +171,12 @@ def create_app(directory=None, start_monitor=True):
         async with locks.setdefault(pid, asyncio.Lock()):
             old = store.project(pid)
             data = old | body.model_dump(exclude={'ssh_password', 'disk_token', 'clear_password'})
-            if any(old.get(k) != data.get(k) for k in ('ssh_host','ssh_port')):
+            if data.get('ssh_profile_id'):
+                for key in ('ssh_host','ssh_user','ssh_key','ssh_password_enc','ssh_fingerprint'):
+                    data[key] = ''
+            elif any(old.get(k) != data.get(k) for k in ('ssh_host','ssh_port')):
                 data['ssh_fingerprint'] = ''
-            if body.ssh_password is not None:
+            if body.ssh_password is not None and not data.get('ssh_profile_id'):
                 data['ssh_password_enc'] = store.encrypt(body.ssh_password)
             if body.clear_password:
                 data['ssh_password_enc'] = ''
@@ -214,33 +237,114 @@ def create_app(directory=None, start_monitor=True):
 
     @app.get('/api/projects/{pid}/ssh/fingerprint', dependencies=auth)
     async def host_fingerprint(pid: str):
-        return await asyncio.to_thread(inspect_host, store.project(pid))
+        return await asyncio.to_thread(inspect_host, store.resolve_project(store.project(pid)))
 
     @app.post('/api/projects/{pid}/ssh/trust', dependencies=auth)
     async def trust_host(pid: str, body: TrustInput):
-        async with locks.setdefault(pid, asyncio.Lock()):
-            project = store.project(pid)
+        async with locks.setdefault(pid, asyncio.Lock()), profiles_lock:
+            raw = store.project(pid)
+            project = store.resolve_project(raw)
             actual = await asyncio.to_thread(inspect_host, project)
             if not secrets.compare_digest(body.fingerprint, actual['fingerprint']):
                 raise RemoteError('Отпечаток изменился. Получите и проверьте его заново.')
-            project['ssh_fingerprint'] = body.fingerprint
-            store.save_project(project)
+            if raw.get('ssh_profile_id'):
+                profile = store.profile(raw['ssh_profile_id'])
+                profile['ssh_fingerprint'] = body.fingerprint
+                store.save_profile(profile)
+            else:
+                raw['ssh_fingerprint'] = body.fingerprint
+                store.save_project(raw)
             store.event(pid, 'info', 'Подтверждён отпечаток SSH-сервера')
         return {'ok': True}
 
-    async def operation(pid, fn, *args):
+    async def operation(pid, fn, *args, require_project=True):
         async with locks.setdefault(pid, asyncio.Lock()):
-            project = store.project(pid)
+            project = store.resolve_project(store.project(pid))
             def execute():
-                with connect(store, project) as conn:
+                with connect(store, project, require_project=require_project) as conn:
                     return fn(conn, *args)
             return await asyncio.to_thread(execute)
 
     @app.post('/api/projects/{pid}/ssh/test', dependencies=auth)
     async def test_ssh(pid: str):
         def test(conn):
-            return {'message': 'SSH подключён. Директория проекта доступна.', 'disk': conn.disk()}
-        return await operation(pid, test)
+            result = {'ok': True, 'message': 'SSH подключён. Можно выбрать папку проекта через проводник.'}
+            try:
+                result['directory'] = {'ok': True, 'path': conn.check_directory()}
+                result['message'] = 'SSH подключён. Директория проекта доступна.'
+            except RemoteError as exc:
+                result['directory'] = {'ok': False, 'error': str(exc)}
+            if result['directory']['ok'] and conn.project['disk_mode'] == 'ssh':
+                try:
+                    result['disk'] = conn.disk()
+                except RemoteError as exc:
+                    result['disk'] = {'error': str(exc)}
+            return result
+        return await operation(pid, test, require_project=False)
+
+    @app.get('/api/projects/{pid}/ssh/directories', dependencies=auth)
+    async def ssh_directories(pid: str, path: str = Query(default='', max_length=1024)):
+        return await operation(pid, lambda conn: conn.directories(path), require_project=False)
+
+    @app.get('/api/ssh-profiles', dependencies=auth)
+    def ssh_profiles():
+        return [public_profile(p, store) for p in store.profiles()]
+
+    @app.post('/api/ssh-profiles', dependencies=auth)
+    async def add_profile(body: SSHProfileInput):
+        async with profiles_lock:
+            data = body.model_dump(exclude={'ssh_password','clear_password'})
+            data.update(id=uuid.uuid4().hex, created_at=now(), ssh_fingerprint='',
+                        ssh_password_enc=store.encrypt(body.ssh_password or ''))
+            store.save_profile(data)
+            return public_profile(data, store)
+
+    @app.put('/api/ssh-profiles/{profile_id}', dependencies=auth)
+    async def edit_profile(profile_id: str, body: SSHProfileInput):
+        async with profiles_lock:
+            old = store.profile(profile_id)
+            data = old | body.model_dump(exclude={'ssh_password','clear_password'})
+            if any(old[k] != data[k] for k in ('ssh_host','ssh_port')):
+                data['ssh_fingerprint'] = ''
+            if body.ssh_password is not None:
+                data['ssh_password_enc'] = store.encrypt(body.ssh_password)
+            if body.clear_password:
+                data['ssh_password_enc'] = ''
+            store.save_profile(data)
+            for p in store.projects():
+                if p.get('ssh_profile_id') == profile_id:
+                    monitor.due[p['id']] = 0
+            return public_profile(data, store)
+
+    @app.delete('/api/ssh-profiles/{profile_id}', dependencies=auth)
+    async def delete_profile(profile_id: str):
+        async with profiles_lock:
+            if not store.delete_profile(profile_id):
+                raise RemoteError('Профиль используется проектами. Сначала выберите для них другой профиль.')
+        return {'ok': True}
+
+    @app.get('/api/ssh-profiles/{profile_id}/fingerprint', dependencies=auth)
+    async def profile_fingerprint(profile_id: str):
+        return await asyncio.to_thread(inspect_host, store.profile(profile_id))
+
+    @app.post('/api/ssh-profiles/{profile_id}/trust', dependencies=auth)
+    async def profile_trust(profile_id: str, body: TrustInput):
+        async with profiles_lock:
+            profile = store.profile(profile_id)
+            actual = await asyncio.to_thread(inspect_host, profile)
+            if not secrets.compare_digest(body.fingerprint, actual['fingerprint']):
+                raise RemoteError('Отпечаток изменился. Получите и проверьте его заново.')
+            profile['ssh_fingerprint'] = body.fingerprint
+            store.save_profile(profile)
+        return {'ok': True}
+
+    @app.post('/api/ssh-profiles/{profile_id}/test', dependencies=auth)
+    async def profile_test(profile_id: str):
+        profile = store.profile(profile_id) | {'ssh_path': ''}
+        def test():
+            with connect(store, profile, require_project=False):
+                return {'ok': True, 'message': 'SSH-профиль подключён. Теперь выберите папку для проекта.'}
+        return await asyncio.to_thread(test)
 
     @app.get('/api/projects/{pid}/git', dependencies=auth)
     async def git_status(pid: str):
@@ -290,11 +394,12 @@ def create_app(directory=None, start_monitor=True):
         return result
 
     @app.post('/api/projects/{pid}/disk/deploy', dependencies=auth)
-    async def deploy_probe(pid: str, body: ConfirmInput):
+    async def deploy_probe(pid: str, body: ProbeDeployInput):
         if not body.confirm:
             raise HTTPException(400, 'Подтвердите установку PHP-файла')
         async with locks.setdefault(pid, asyncio.Lock()):
-            project = store.project(pid)
+            raw = store.project(pid)
+            project = store.resolve_project(raw)
             token = secrets.token_urlsafe(32)
             def deploy():
                 with connect(store, project) as conn, conn.client.open_sftp() as sftp:
@@ -306,8 +411,12 @@ def create_app(directory=None, start_monitor=True):
                     except OSError as exc:
                         raise RemoteError('Файл .devlin-disk.php уже существует или недоступен для записи. Существующий файл не перезаписывается.') from exc
             await asyncio.to_thread(deploy)
-            project['disk_token_enc'] = store.encrypt(token)
-            store.save_project(project)
+            raw['disk_token_enc'] = store.encrypt(token)
+            if body.disk_url:
+                raw['disk_url'] = body.disk_url
+                raw['disk_mode'] = 'http'
+            store.save_project(raw)
+            monitor.due[pid] = 0
             store.event(pid, 'info', 'В корень проекта установлен .devlin-disk.php. Настройте HTTPS URL для пробы.')
             return {'token': token, 'filename': '.devlin-disk.php', 'message': 'Установлено. Скопируйте ключ сейчас: повторно он не показывается.'}
 

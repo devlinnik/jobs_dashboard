@@ -2,8 +2,10 @@ import base64
 import hashlib
 import hmac
 import os
+import posixpath
 import shlex
 import socket
+import stat
 import time
 from contextlib import contextmanager
 import paramiko
@@ -46,8 +48,10 @@ class Connection:
         self.project = project
         self.path = project['ssh_path']
 
-    def run(self, command, timeout=35, max_output=2_000_000):
-        full = 'cd -- ' + shlex.quote(self.path) + ' && ' + command
+    def run(self, command, timeout=35, max_output=2_000_000, in_project=True):
+        if in_project and not self.path:
+            raise RemoteError('Папка проекта не выбрана. Откройте SSH-проводник в настройках проекта.')
+        full = ('cd -- ' + shlex.quote(self.path) + ' && ' if in_project else '') + command
         channel = self.client.get_transport().open_session(timeout=10)
         channel.settimeout(1)
         channel.exec_command(full)
@@ -85,8 +89,61 @@ class Connection:
                 reason = 'Не удалось разрешить имя Git-хостинга. Проверьте DNS и сеть сервера.'
             elif 'command not found' in text or 'git: not found' in text:
                 reason = 'На сервере не установлен Git или нужная системная команда.'
+            elif 'no such file or directory' in text or "can't cd" in text or 'cannot cd' in text:
+                reason = 'Папка проекта не найдена или недоступна. Выберите её через SSH-проводник.'
+            elif 'not a git repository' in text:
+                reason = 'В выбранной папке нет Git-репозитория. Подключите его в разделе Git.'
             raise RemoteError('Команда сервера завершилась с ошибкой (код %s). %s' % (code, reason))
         return out.decode('utf-8', errors='replace')
+
+    def check_directory(self):
+        if not self.path:
+            raise RemoteError('Папка проекта не выбрана. Выберите её через SSH-проводник в настройках проекта.')
+        path = shlex.quote(self.path)
+        try:
+            code, out, _ = self.run(f'test -d {path} || exit 41; test -x {path} || exit 42; cd -- {path} && pwd -P', in_project=False)
+        except paramiko.SSHException as exc:
+            raise RemoteError('SSH подключён, но проверить папку через shell не удалось. Проверьте, разрешено ли выполнение команд этому пользователю.') from exc
+        if code == 41:
+            raise RemoteError('Папка проекта не существует или недоступна для этого SSH-пользователя. Выберите другую папку через SSH-проводник.')
+        if code:
+            raise RemoteError('SSH подключён, но перейти в папку проекта не удалось. Проверьте права доступа или выберите другую папку.')
+        return out.decode('utf-8', errors='replace').strip()
+
+    def directories(self, path=''):
+        if path and (not path.startswith('/') or len(path) > 1024 or any(c in path for c in '\x00\r\n')):
+            raise RemoteError('Укажите абсолютный путь к папке сервера.')
+        try:
+            with self.client.open_sftp() as sftp:
+                sftp.get_channel().settimeout(15)
+                current = sftp.normalize(path or '.')
+                if not current.startswith('/') or len(current) > 1024 or any(c in current for c in '\x00\r\n'):
+                    raise RemoteError('SFTP-сервер вернул неподдерживаемый путь.')
+                if not stat.S_ISDIR(sftp.stat(current).st_mode):
+                    raise RemoteError('Выбранный путь не является папкой.')
+                folders, truncated = [], False
+                deadline = time.monotonic() + 20
+                for index, entry in enumerate(sftp.listdir_iter(current, read_aheads=1)):
+                    if time.monotonic() > deadline:
+                        raise RemoteError('Чтение каталога превысило время ожидания. Откройте более узкую папку по её пути.')
+                    if index >= 5000 or len(folders) >= 1000:
+                        truncated = True
+                        break
+                    name = entry.filename
+                    child = posixpath.join(current, name)
+                    if name in ('.', '..') or '/' in name or len(child) > 1024 or any(c in name for c in '\x00\r\n'):
+                        continue
+                    if stat.S_ISDIR(entry.st_mode or 0) or stat.S_ISLNK(entry.st_mode or 0):
+                        folders.append({'name': name, 'path': child, 'symlink': stat.S_ISLNK(entry.st_mode or 0)})
+                folders.sort(key=lambda item: item['name'].casefold())
+                return {'path': current, 'parent': posixpath.dirname(current) if current != '/' else None,
+                        'directories': folders, 'truncated': truncated}
+        except PermissionError as exc:
+            raise RemoteError('Нет прав на просмотр этой папки. Выберите другую или проверьте права SSH-пользователя.') from exc
+        except FileNotFoundError as exc:
+            raise RemoteError('Папка не найдена. Перейдите в домашнюю папку или укажите другой путь.') from exc
+        except (OSError, paramiko.SSHException, EOFError) as exc:
+            raise RemoteError('Не удалось прочитать каталог по SFTP. Проверьте, включён ли SFTP на сервере и есть ли права просмотра.') from exc
 
     def disk(self):
         output = self.text('LC_ALL=C df -Pk -- ' + shlex.quote(self.path))
@@ -98,7 +155,7 @@ class Connection:
 
 
 @contextmanager
-def connect(store, project):
+def connect(store, project, require_project=True):
     if not project.get('ssh_host'):
         raise RemoteError('Сначала настройте SSH проекта')
     if not project.get('ssh_fingerprint'):
@@ -115,7 +172,8 @@ def connect(store, project):
         client.get_transport().set_keepalive(20)
         conn = Connection(client, project)
         # Require a real directory, never create or move a server project implicitly.
-        conn.text('test -d ' + shlex.quote(project['ssh_path']) + ' && pwd -P')
+        if require_project:
+            conn.check_directory()
         yield conn
     except RemoteError:
         raise
