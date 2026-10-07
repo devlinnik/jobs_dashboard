@@ -3,6 +3,14 @@ on:
   workflow_dispatch:
   push:
     tags: ['v*']
+    branches: [main]
+    paths:
+      - 'dashboard/**'
+      - 'scripts/**'
+      - '*.cmd'
+      - 'run.py'
+      - 'requirements*.txt'
+      - '.github/workflows/windows-build.yml'
 permissions:
   contents: read
 jobs:
@@ -15,11 +23,22 @@ jobs:
           python-version: '3.12'
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
+      - name: Windows PowerShell installer checks
+        shell: cmd
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-installer.ps1
       - name: API and Git tests
         run: python -m pytest -q
       - name: Build desktop application
         shell: pwsh
         run: ./scripts/build-windows.ps1
+      - name: Verify packaged startup again
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP 'devlin-packaged-check.json'
+          $process = Start-Process ./dist/DevlinDesk/DevlinDesk.exe -ArgumentList @('--self-test', '--self-test-output', ('"' + $report + '"')) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Packaged startup failed' }
+          $result = Get-Content $report -Raw | ConvertFrom-Json
+          if (-not $result.ok) { throw 'Packaged readiness report is invalid' }
       - uses: actions/upload-artifact@v4
         with:
           name: DevlinDesk-Windows

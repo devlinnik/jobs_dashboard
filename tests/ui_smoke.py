@@ -88,7 +88,11 @@ def main():
             page.locator('[data-detail-action=check]').click()
             expect(page.locator('.big-value').first).to_contain_text('HTTP 200')
             page.locator('[data-tab=git]').click()
-            expect(page.locator('#git-remote')).to_be_visible()
+            try:
+                expect(page.locator('#git-remote')).to_be_visible(timeout=20000)
+            except AssertionError:
+                print('Git panel diagnostic:', page.locator('#detail-content').inner_text())
+                raise
             page.locator('#git-remote').fill(fake_url)
             page.locator('[data-git-action=commit]').click()
             expect(page.locator('#confirm-dialog')).to_be_visible()

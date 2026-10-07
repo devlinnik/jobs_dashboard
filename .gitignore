@@ -10,3 +10,8 @@ dist/
 *.spec
 .local-data/
 test-results/
+.build-venv/
+.build/
+.DevlinDesk-staging-*/
+DevlinDesk.previous-*/
+.DevlinDesk-install-*.lock
