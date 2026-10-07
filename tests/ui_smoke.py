@@ -29,6 +29,19 @@ def free_port():
         sock.bind(('127.0.0.1',0)); return sock.getsockname()[1]
 
 
+def assert_toast_above_dialog(page, dialog, message):
+    toast = page.locator('#toast-region .toast').filter(has_text=message).last
+    expect(toast).to_be_visible()
+    expect(toast).to_have_css('opacity', '1')
+    expect(page.locator(dialog+' > #toast-region')).to_be_attached()
+    toast.scroll_into_view_if_needed()
+    assert toast.evaluate('''node => {
+        const rect = node.getBoundingClientRect();
+        const target = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        return node === target || node.contains(target);
+    }'''), 'Notification is hidden behind the modal or its backdrop'
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix='devlin-ui-') as directory, ExitStack() as stack:
         temp = Path(directory)
@@ -62,7 +75,9 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            expect(page.locator('#app-version')).to_have_text('v1.4.0')
+            expect(page.locator('#app-version')).to_have_text('v1.5.0')
+            assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == 'light'
+            assert page.evaluate("parseFloat(getComputedStyle(document.body).fontSize)") >= 16
             page.locator('[data-nav=ssh-profiles]').click()
             expect(page.locator('#ssh-profiles-page')).to_be_visible()
             page.locator('#new-ssh-profile').click()
@@ -80,6 +95,9 @@ def main():
             expect(page.locator('#ssh-profile-info')).to_contain_text('Ключ подтверждён')
             page.locator('#ssh-profile-test').click()
             expect(page.get_by_text('SSH-профиль подключён. Теперь выберите папку для проекта.', exact=True)).to_be_visible()
+            assert_toast_above_dialog(page, '#ssh-profile-dialog', 'SSH-профиль подключён')
+            page.locator('#toast-region .toast').filter(has_text='SSH-профиль подключён').get_by_role('button',name='Закрыть уведомление').click()
+            expect(page.locator('#toast-region .toast').filter(has_text='SSH-профиль подключён')).to_have_count(0)
             page.locator('[data-close=ssh-profile-dialog]').first.click()
             expect(page.locator('.ssh-profile-row')).to_have_count(1)
             page.locator('[data-nav=git-profiles]').click()
@@ -93,9 +111,10 @@ def main():
             expect(page.locator('#git-profile-test')).to_be_enabled()
             page.locator('#git-profile-test').click()
             expect(page.locator('#git-profile-info')).to_have_text('Авторизация проверена: developer')
+            assert_toast_above_dialog(page, '#git-profile-dialog', 'Авторизация проверена: developer')
             page.locator('[data-close=git-profile-dialog]').first.click()
             screenshot = ROOT/'test-results'; screenshot.mkdir(exist_ok=True)
-            page.screenshot(path=str(screenshot/'git-profiles.png'))
+            page.screenshot(path=str(screenshot/'git-profiles.png'), animations='disabled')
             page.locator('[data-nav=projects]').click()
             page.locator('#hero-add').click()
             form=page.locator('#project-form')
@@ -130,7 +149,7 @@ def main():
             page.locator(f'#remote-folders [data-remote-path="{server_files}"]').click(timeout=20000)
             expect(page.locator('#remote-path')).to_have_value(str(server_files), timeout=20000)
             screenshot = ROOT/'test-results'; screenshot.mkdir(exist_ok=True)
-            page.screenshot(path=str(screenshot/'ssh-browser.png'))
+            page.screenshot(path=str(screenshot/'ssh-browser.png'), animations='disabled')
             page.locator('#remote-select').click()
             expect(form.locator('[name=ssh_path]')).to_have_value(str(server_files))
             assert page.evaluate("fetch('/api/projects',{headers:{'X-App-Request':'1'}}).then(r=>r.json()).then(p=>p[0].ssh_path)") == str(server_files)
@@ -138,6 +157,12 @@ def main():
             expect(page.locator('#project-form-dialog')).not_to_be_visible()
             page.locator('[data-detail-action=ssh-test]').click()
             expect(page.get_by_text('SSH подключён. Директория проекта доступна.',exact=True)).to_be_visible()
+            assert_toast_above_dialog(page, '#detail-dialog', 'SSH подключён. Директория проекта доступна.')
+            page.locator('[data-detail-action=fingerprint]').click()
+            expect(page.locator('#confirm-dialog')).to_be_visible()
+            assert_toast_above_dialog(page, '#confirm-dialog', 'SSH подключён. Директория проекта доступна.')
+            page.locator('#confirm-cancel').click()
+            assert_toast_above_dialog(page, '#detail-dialog', 'SSH подключён. Директория проекта доступна.')
             page.locator('[data-detail-action=deploy]').click()
             expect(page.locator('#probe-setup-dialog')).to_be_visible()
             expect(page.locator('#probe-target')).to_contain_text(str(server_files))
@@ -160,6 +185,7 @@ def main():
             page.locator('#confirm-accept').click()
             expect(page.locator('#git-connect-dialog')).not_to_be_visible(timeout=20000)
             expect(page.locator('#detail-content')).to_contain_text(git_host['remote'])
+            assert page.locator('.file-name').first.evaluate('node => parseFloat(getComputedStyle(node).fontSize)') >= 14
             page.locator('[data-git-action=check]').click()
             expect(page.get_by_text('Репозиторий подключён, доступ на чтение с сервера проверен. Право записи проверяется при push.',exact=True)).to_be_visible(timeout=20000)
             page.locator('[data-git-action=commit]').click()
@@ -171,9 +197,12 @@ def main():
                 print('Git import diagnostic:', page.locator('#detail-content').inner_text(), page.locator('#toast').inner_text())
                 raise
             assert subprocess.check_output(['git','-C',str(bare),'show','main:index.php']).decode() == '<?php echo "Initial";'
+            assert_toast_above_dialog(page, '#detail-dialog', 'отправлен в origin')
+            page.screenshot(path=str(screenshot/'git-notification.png'), animations='disabled')
             (server_files/'index.php').write_text('<?php echo "Updated on server";')
             page.locator('[data-git-action=refresh]').click()
             expect(page.locator('.git-file')).to_have_count(1)
+            assert page.locator('#detail-dialog').evaluate('node => node.scrollHeight <= node.clientHeight + 1'), 'Project dialog has an extra outer scrollbar'
             page.locator('[data-file-diff]').click()
             expect(page.locator('#file-diff')).to_contain_text('Updated on server')
             page.locator('[data-git-action=commit]').click(); page.locator('#confirm-accept').click()
@@ -193,7 +222,7 @@ def main():
             page.locator('#status-filter').select_option('error'); expect(page.locator('.project-card')).to_have_count(1)
             page.locator('#status-filter').select_option('all')
             screenshot=ROOT/'test-results'; screenshot.mkdir(exist_ok=True)
-            page.screenshot(path=str(screenshot/'dashboard.png'),full_page=True)
+            page.screenshot(path=str(screenshot/'dashboard.png'),full_page=True, animations='disabled')
             page.locator('[data-nav=settings]').click()
             expect(page.locator('#settings-form')).to_be_visible()
             page.locator('#settings-form [name=pin]').fill('1234')
@@ -222,7 +251,7 @@ def main():
                 assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), f'Horizontal overflow at {width}px'
             assert errors == [], errors
             browser.close()
-            print('UI smoke passed: SSH/Git profiles, provider authorization, repository picker/attach/access check, verified HTTPS Git push, SFTP browsing, probe HTTPS validation, CRUD, HTTP, diff/commit, journal, filters, PIN, XSS escaping, responsive layout. Screenshots: test-results/dashboard.png, ssh-browser.png, git-profiles.png')
+            print('UI smoke passed: light theme, larger fonts, clickable notifications above nested modals, project scrolling, SSH/Git profiles, provider authorization, repository picker/attach/access check, HTTPS Git push, SFTP, CRUD, diff/commit, journal, filters, PIN, XSS, responsive layout. Screenshots: test-results/dashboard.png, ssh-browser.png, git-profiles.png, git-notification.png')
 
 
 if __name__ == '__main__': main()

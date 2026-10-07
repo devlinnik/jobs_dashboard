@@ -51,8 +51,24 @@ function toast(message, error = false) {
   node.innerHTML = icon(error ? 'alert' : 'check') + '<span></span><button aria-label="Закрыть уведомление">×</button>';
   $('span', node).textContent = message;
   $('button', node).onclick = () => node.remove();
-  $('#toast-region').append(node); setTimeout(() => node.remove(), error ? 14000 : 6500);
+  const region = $('#toast-region'); region.append(node); region.scrollTop = region.scrollHeight;
+  setTimeout(() => node.remove(), error ? 20000 : 10000);
 }
+
+// A modal dialog lives in the browser's top layer: z-index on the page cannot
+// raise a toast above it, and the rest of the document is inert. Keep the same
+// live region inside the most recently opened dialog, moving it back on close.
+const notificationDialogs = [];
+new MutationObserver(records => {
+  for (const {target} of records) {
+    if (!(target instanceof HTMLDialogElement)) continue;
+    const index = notificationDialogs.indexOf(target);
+    if (index !== -1) notificationDialogs.splice(index, 1);
+    if (target.open) notificationDialogs.push(target);
+  }
+  const host = notificationDialogs.at(-1) || document.body;
+  if ($('#toast-region').parentElement !== host) host.append($('#toast-region'));
+}).observe(document.body, {subtree:true, attributes:true, attributeFilter:['open']});
 async function busy(button, fn) {
   if (button?.disabled) return;
   if (button) button.disabled = true;
