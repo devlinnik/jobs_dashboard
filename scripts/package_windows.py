@@ -3,6 +3,7 @@
 This coordinator uses only the standard library so it can bootstrap its build venv.
 """
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.request
 import uuid
 import zipfile
@@ -26,6 +28,50 @@ MAX_EXPANDED = 600 * 1024 * 1024
 
 class InstallError(RuntimeError):
     pass
+
+
+def retry_windows_lock(action, description):
+    """Retry only Windows access/sharing errors, never a failing program exit."""
+    for attempt in range(8):
+        try:
+            return action()
+        except OSError as error:
+            if getattr(error, 'winerror', None) not in (5, 32, 33):
+                raise
+            if attempt == 7:
+                raise InstallError(
+                    f'{description}: Windows denied access after 8 attempts. {error}. '
+                    'Check Windows Security Protection history and application-control policies '
+                    'for this exact file, and verify folder permissions. Do not disable protection.'
+                ) from error
+            print(f'{description}: file temporarily unavailable; retrying in 2 seconds '
+                  f'({attempt + 1}/8).', flush=True)
+            time.sleep(2)
+
+
+def cleanup_directory(path):
+    """A locked temporary EXE must not hide the original installation error."""
+    try:
+        retry_windows_lock(lambda: shutil.rmtree(path), 'Removing temporary build files')
+    except (OSError, InstallError) as error:
+        print(f'WARNING: Temporary files retained at {path}: {error}', file=sys.stderr)
+
+
+@contextmanager
+def build_workspace(build_root):
+    work = Path(tempfile.mkdtemp(prefix='release-', dir=build_root))
+    try:
+        yield work
+    except Exception:
+        log = build_root / 'install-error.log'
+        try:
+            log.write_text(traceback.format_exc(), encoding='utf-8')
+            print(f'Installation diagnostic log: {log}', file=sys.stderr)
+        except OSError:
+            traceback.print_exc()
+        raise
+    finally:
+        cleanup_directory(work)
 
 
 class FileLock:
@@ -189,13 +235,26 @@ start "" /D "%~dp0." "%~dp0DevlinDesk.exe"
 
 def verify_release(release, work):
     report = work / ('self-test-' + uuid.uuid4().hex + '.json')
-    run([release / 'DevlinDesk.exe', '--self-test', '--self-test-output', report], timeout=90)
+    executable = release / 'DevlinDesk.exe'
+    print(f'Checking executable startup: {executable}', flush=True)
+    try:
+        retry_windows_lock(lambda: run([executable, '--self-test', '--self-test-output', report], timeout=90),
+                           f'Starting {executable}')
+    except InstallError as error:
+        if report.is_file():
+            try:
+                details = json.loads(report.read_text(encoding='utf-8')).get('error')
+            except (OSError, ValueError, AttributeError):
+                details = None
+            if details:
+                raise InstallError(f'{error}. Startup diagnostic: {details}') from error
+        raise
     try:
         result = json.loads(report.read_text(encoding='utf-8'))
     except (OSError, ValueError) as exc:
         raise InstallError('The executable did not produce a readiness report.') from exc
     if result.get('ok') is not True:
-        raise InstallError('The built executable failed its startup/asset check.')
+        raise InstallError('The built executable failed its startup/asset check: ' + str(result.get('error', 'no details')))
 
 
 def check_running(target, checker):
@@ -232,23 +291,25 @@ def promote(release, target, verify, before_replace=lambda: None):
     prepared = target.parent / ('.DevlinDesk-staging-' + uuid.uuid4().hex)
     backup = None
     try:
-        shutil.copytree(release, prepared)
+        print(f'Copying built application to: {prepared}', flush=True)
+        shutil.copytree(release, prepared, copy_function=lambda src, dst:
+                        retry_windows_lock(lambda: shutil.copy2(src, dst), f'Copying {src} to {dst}'))
         verify(prepared)
         before_replace()
         # Recheck after a potentially long copy/test and before touching the old folder.
         known_installation(target)
         if target.exists():
             backup = target.parent / (target.name + '.previous-' + time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
-            target.rename(backup)
+            retry_windows_lock(lambda: target.rename(backup), f'Preserving previous application at {backup}')
         try:
-            prepared.rename(target)
-        except OSError:
+            retry_windows_lock(lambda: prepared.rename(target), f'Installing application at {target}')
+        except (OSError, InstallError):
             if backup and backup.exists() and not target.exists():
-                backup.rename(target)
+                retry_windows_lock(lambda: backup.rename(target), f'Restoring previous application at {target}')
             raise
     finally:
         if prepared.exists():
-            shutil.rmtree(prepared)
+            cleanup_directory(prepared)
     return backup
 
 
@@ -273,8 +334,7 @@ def main():
     if args.result.exists():
         args.result.unlink()
     with FileLock(build_root / "install.lock"), FileLock(target.parent / (".DevlinDesk-install-" + target.name + ".lock")):
-        with tempfile.TemporaryDirectory(prefix='release-', dir=build_root) as temp:
-            work = Path(temp)
+        with build_workspace(build_root) as work:
             source, metadata = root, {'method': 'local'}
             if args.refresh:
                 if (root / '.git').exists():

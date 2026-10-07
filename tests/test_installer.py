@@ -8,6 +8,104 @@ import pytest
 from scripts import package_windows as installer
 
 
+def windows_access_error():
+    error = PermissionError('simulated Windows access denial')
+    error.winerror = 5
+    return error
+
+
+def test_readiness_waits_for_transient_windows_exe_lock(tmp_path, monkeypatch):
+    release = release_at(tmp_path/'release', 'new')
+    calls = []
+    sleeps = []
+    def start(args, **kwargs):
+        calls.append(args)
+        if len(calls) < 3:
+            raise windows_access_error()
+        Path(args[-1]).write_text(json.dumps({'ok': True}))
+    monkeypatch.setattr(installer, 'run', start)
+    monkeypatch.setattr(installer.time, 'sleep', sleeps.append)
+    installer.verify_release(release, tmp_path)
+    assert len(calls) == 3 and sleeps == [2, 2]
+
+
+def test_permanent_windows_denial_is_bounded_and_actionable(monkeypatch):
+    calls = []
+    monkeypatch.setattr(installer.time, 'sleep', lambda seconds: None)
+    def denied():
+        calls.append(1)
+        raise windows_access_error()
+    with pytest.raises(installer.InstallError, match='Protection history'):
+        installer.retry_windows_lock(denied, 'Starting DevlinDesk.exe')
+    assert len(calls) == 8
+
+
+def test_failing_executable_is_not_retried():
+    calls = []
+    def failed():
+        calls.append(1)
+        raise installer.InstallError('Command failed (exit 1)')
+    with pytest.raises(installer.InstallError, match='exit 1'):
+        installer.retry_windows_lock(failed, 'Startup check')
+    assert len(calls) == 1
+
+
+def test_startup_failure_includes_executable_report(tmp_path, monkeypatch):
+    release = release_at(tmp_path/'release', 'new')
+    def failed(args, **kwargs):
+        Path(args[-1]).write_text(json.dumps({'ok': False, 'error': 'Missing packaged asset'}))
+        raise installer.InstallError('Command failed (exit 1)')
+    monkeypatch.setattr(installer, 'run', failed)
+    with pytest.raises(installer.InstallError, match='Missing packaged asset'):
+        installer.verify_release(release, tmp_path)
+
+
+def test_copy_waits_for_transient_windows_lock(tmp_path, monkeypatch):
+    old = release_at(tmp_path/'dist/DevlinDesk', 'old')
+    new = release_at(tmp_path/'build/release', 'new')
+    original = installer.shutil.copy2
+    exe_attempts = []
+    def copy(src, dst):
+        if Path(src).name == 'DevlinDesk.exe':
+            exe_attempts.append(1)
+            if len(exe_attempts) == 1:
+                raise windows_access_error()
+        return original(src, dst)
+    monkeypatch.setattr(installer.shutil, 'copy2', copy)
+    monkeypatch.setattr(installer.time, 'sleep', lambda seconds: None)
+    backup = installer.promote(new, old, lambda folder: None)
+    assert len(exe_attempts) == 2
+    assert (old/'DevlinDesk.exe').read_text() == 'new'
+    assert (backup/'DevlinDesk.exe').read_text() == 'old'
+
+
+def test_cleanup_lock_preserves_original_error_and_installed_app(tmp_path, monkeypatch, capsys):
+    old = release_at(tmp_path/'dist/DevlinDesk', 'old')
+    new = release_at(tmp_path/'build/release', 'new')
+    monkeypatch.setattr(installer.time, 'sleep', lambda seconds: None)
+    def locked(path):
+        raise windows_access_error()
+    monkeypatch.setattr(installer.shutil, 'rmtree', locked)
+    def failed(folder):
+        raise installer.InstallError('original startup failure')
+    with pytest.raises(installer.InstallError, match='original startup failure'):
+        installer.promote(new, old, failed)
+    assert (old/'DevlinDesk.exe').read_text() == 'old'
+    assert 'Temporary files retained' in capsys.readouterr().err
+
+
+def test_build_workspace_logs_original_error_even_when_cleanup_is_locked(tmp_path, monkeypatch):
+    monkeypatch.setattr(installer.time, 'sleep', lambda seconds: None)
+    def locked(path):
+        raise windows_access_error()
+    monkeypatch.setattr(installer.shutil, 'rmtree', locked)
+    with pytest.raises(installer.InstallError, match='readiness failed'):
+        with installer.build_workspace(tmp_path):
+            raise installer.InstallError('readiness failed')
+    log = (tmp_path/'install-error.log').read_text()
+    assert 'readiness failed' in log and 'Traceback' in log
+
+
 def release_at(path, version):
     path.mkdir(parents=True)
     (path/'DevlinDesk.exe').write_text(version)
