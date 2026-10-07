@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, field_validator
 from .store import Store, now
 from .security import Sessions, hash_pin, verify_pin
-from .models import ProjectInput, SettingsInput, SyncInput, InitInput, SSHProfileInput, GitProfileInput, GitAttachInput, GitPushInput, GitIgnoreInput, web_url
+from .models import ProjectInput, SettingsInput, SyncInput, InitInput, SSHProfileInput, GitProfileInput, GitAttachInput, GitPushInput, GitIgnoreInput, GitUnstageInput, web_url
 from .remote import connect, inspect_host, RemoteError
 from .monitor import Monitor, probe_script
 from . import gitops
@@ -503,6 +503,12 @@ def create_app(directory=None, start_monitor=True):
         previous.pop('pending_push', None)
         store.save_state(pid, previous)
         monitor.due[pid] = 0
+        return result
+
+    @app.post('/api/projects/{pid}/git/unstage', dependencies=auth)
+    async def git_unstage(pid: str, body: GitUnstageInput):
+        result = await operation(pid, gitops.unstage, body)
+        store.event(pid, 'success', result['message'])
         return result
 
     @app.post('/api/projects/{pid}/git/sync', dependencies=auth)

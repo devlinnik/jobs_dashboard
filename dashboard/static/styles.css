@@ -57,3 +57,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
 .telegram-status-info{white-space:pre-line;margin:14px 0;overflow-wrap:anywhere}
 .nav-item [data-icon]{display:flex;align-items:center;justify-content:center;width:20px;height:20px;flex:0 0 20px}
 .nav-item [data-icon] svg{width:20px;height:20px;aspect-ratio:1;flex-shrink:0}
+
+/* A disabled action is distinct from an operation currently running. */
+.button:disabled{cursor:not-allowed}
+.button[aria-busy="true"]{cursor:wait}

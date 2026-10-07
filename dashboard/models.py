@@ -207,6 +207,12 @@ class SettingsInput(BaseModel):
         return value
 
 
+class GitUnstageInput(BaseModel):
+    snapshot: str
+    index_snapshot: str = Field(min_length=64, max_length=64)
+    confirm: bool = False
+
+
 class SyncInput(BaseModel):
     snapshot: str
     files: list[str] = Field(min_length=1, max_length=2000)

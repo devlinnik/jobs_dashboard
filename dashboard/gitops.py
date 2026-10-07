@@ -280,9 +280,11 @@ def status(conn, include_snapshot=True):
             validate_remote(remote)
         except RemoteError:
             remote = '(адрес скрыт: небезопасный URL; настройте SSH remote на сервере)'
+    staged = any(f['status'][0] not in (' ', '?') for f in files)
+    index_snapshot = hashlib.sha256(conn.text('git ls-files --stage -z').encode()).hexdigest() if staged and include_snapshot else ''
     return {'connected': True, 'files': files, 'snapshot': snapshot(conn, raw, files, head) if include_snapshot else '',
             'branch': branch, 'head': head[:12], 'remote': remote,
-            'staged': any(f['status'][0] not in (' ', '?') for f in files)}
+            'staged': staged, 'index_snapshot': index_snapshot}
 
 
 def diff(conn, path):
@@ -441,7 +443,7 @@ def fetch_commits(conn, settings):
 
 def commit(conn, current, files, message, settings, push=False):
     if current.get('staged'):
-        raise RemoteError('На сервере уже есть staged-изменения. Завершите или отмените их на сервере перед синхронизацией.')
+        raise RemoteError('На сервере уже есть подготовленные изменения. В разделе «Git & файлы» нажмите «Убрать подготовку к коммиту», затем выберите файлы заново.')
     allowed = {f['path'] for f in current['files'] if f['allowed']}
     if len(set(files)) != len(files) or any(p not in allowed for p in files):
         raise RemoteError('Выбранные файлы больше не входят в допустимые изменения. Обновите список: .gitignore, исключённые пути или изменения на сервере могли изменить набор. Файлы не добавлены в индекс.')
@@ -483,6 +485,27 @@ def commit(conn, current, files, message, settings, push=False):
         else:
             result['pushed'] = True
     return result
+
+
+
+def unstage(conn, request):
+    """Clear only the index after confirming both worktree and staged object hashes."""
+    if not request.confirm:
+        raise RemoteError('Подтвердите отмену подготовки файлов к коммиту.')
+    current = status(conn)
+    if not current['connected'] or not current.get('staged'):
+        raise RemoteError('Подготовленных изменений нет. Обновите список файлов.')
+    if request.snapshot != current['snapshot'] or request.index_snapshot != current['index_snapshot']:
+        raise RemoteError('Файлы или индекс изменились после просмотра. Обновите список и подтвердите заново.')
+    if conn.text('git ls-files --unmerged -z'):
+        raise RemoteError('В индексе есть конфликты слияния. Сначала разрешите их на сервере; подготовка не изменена.')
+    if current['head']:
+        conn.text('git reset --mixed HEAD', context='Отмена подготовки файлов к коммиту')
+    else:
+        # Unborn branches have no HEAD to reset to. --cached affects only the
+        # index; force also allows staged content differing from the worktree.
+        conn.text('git rm --cached -r -f --ignore-unmatch -- .', context='Отмена подготовки первого коммита')
+    return {'ok': True, 'message': 'Подготовка к коммиту отменена. Файлы на сервере сохранены; выберите их и создайте коммит.'}
 
 
 def sync(conn, request, settings):

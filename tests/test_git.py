@@ -181,7 +181,7 @@ def test_snapshot_detects_content_changes_and_staged_is_preserved(repo):
         gitops.sync(conn,SimpleNamespace(snapshot=old['snapshot'],files=['index.php'],message='update',push=False),{'git_name':'Desk','git_email':'desk@example.com'})
     git(work,'add','index.php')
     fresh = gitops.status(conn)
-    with pytest.raises(RemoteError,match='staged'):
+    with pytest.raises(RemoteError,match='подготовленные изменения'):
         gitops.sync(conn,SimpleNamespace(snapshot=fresh['snapshot'],files=['index.php'],message='update',push=False),{'git_name':'Desk','git_email':'desk@example.com'})
     assert git(work,'diff','--cached','--name-only') == 'index.php'
 
@@ -469,3 +469,81 @@ def test_access_settings_and_diagnostics_explain_https_without_exposing_commands
     messages = str(report)
     assert 'HTTPS' in messages and 'SSH-ключ здесь не применяется' in messages
     assert '/server/git-key' in messages and 'secret-command' not in messages
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize('unborn', [False, True])
+def test_unstage_preserves_worktree_and_allows_commit_with_or_without_head(repo, tmp_path, unborn):
+    if unborn:
+        work = tmp_path / 'unborn'; work.mkdir(); git(work, 'init', '-b', 'main')
+        conn = LocalConnection(work)
+    else:
+        work, conn = repo
+    (work / 'index.php').write_text('staged version')
+    git(work, 'add', '--', 'index.php')
+    (work / 'index.php').write_text('latest unstaged version')
+    (work / '.gitignore').write_text('cache/\n')
+    git(work, 'add', '--', '.gitignore')
+    before = git(work, 'rev-parse', 'HEAD') if not unborn else ''
+    current = gitops.status(conn)
+    assert current['staged']
+    request = SimpleNamespace(confirm=True, snapshot=current['snapshot'], index_snapshot=current['index_snapshot'])
+    assert gitops.unstage(conn, request)['ok']
+    fresh = gitops.status(conn)
+    assert not fresh['staged']
+    assert (work / 'index.php').read_text() == 'latest unstaged version'
+    assert (work / '.gitignore').read_text() == 'cache/\n'
+    assert not before or git(work, 'rev-parse', 'HEAD') == before
+    result = gitops.sync(conn, SimpleNamespace(snapshot=fresh['snapshot'], files=['index.php', '.gitignore'], message='After unstage', push=False), {'git_name':'Test', 'git_email':'test@example.com'})
+    assert result['commit'] and not result['pushed']
+    assert git(work, 'show', 'HEAD:index.php') == 'latest unstaged version'
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize('change', ['index', 'worktree', 'confirmation'])
+def test_unstage_refuses_stale_index_worktree_and_missing_confirmation(repo, change):
+    work, conn = repo
+    (work / 'index.php').write_text('version B'); git(work, 'add', 'index.php')
+    (work / 'index.php').write_text('version C')
+    current = gitops.status(conn)
+    if change == 'index':
+        (work / 'index.php').write_text('version D'); git(work, 'add', 'index.php')
+        (work / 'index.php').write_text('version C')
+        changed = gitops.status(conn)
+        assert changed['snapshot'] == current['snapshot']
+        assert changed['index_snapshot'] != current['index_snapshot']
+    elif change == 'worktree':
+        (work / 'index.php').write_text('version D')
+    expected = git(work, 'show', ':index.php')
+    request = SimpleNamespace(confirm=change != 'confirmation', snapshot=current['snapshot'], index_snapshot=current['index_snapshot'])
+    with pytest.raises(RemoteError, match='изменились|Подтвердите'):
+        gitops.unstage(conn, request)
+    assert git(work, 'show', ':index.php') == expected
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize('change', ['rename', 'delete'])
+def test_unstage_never_restores_deleted_or_renamed_working_files(repo, change):
+    work, conn = repo
+    git(work, 'mv', 'index.php', 'renamed.php') if change == 'rename' else git(work, 'rm', 'index.php')
+    current = gitops.status(conn)
+    request = SimpleNamespace(confirm=True, snapshot=current['snapshot'], index_snapshot=current['index_snapshot'])
+    assert gitops.unstage(conn, request)['ok']
+    assert not (work / 'index.php').exists()
+    assert not gitops.status(conn)['staged']
+    if change == 'rename':
+        assert (work / 'renamed.php').read_text() == 'v1'
+
+
+@POSIX_ONLY
+def test_unstage_refuses_merge_conflicts(repo):
+    work, conn = repo
+    blob = git(work, 'rev-parse', 'HEAD:index.php')
+    entries = f'0 {blob}\tindex.php\n' + ''.join(f'100644 {blob} {stage}\tindex.php\n' for stage in (1, 2, 3))
+    subprocess.run(['git', '-C', str(work), 'update-index', '--index-info'], input=entries.encode(), check=True)
+    current = gitops.status(conn)
+    request = SimpleNamespace(confirm=True, snapshot=current['snapshot'], index_snapshot=current['index_snapshot'])
+    with pytest.raises(RemoteError, match='конфликты слияния'):
+        gitops.unstage(conn, request)
+    assert git(work, 'ls-files', '--unmerged')
+    assert (work / 'index.php').read_text() == 'v1'
