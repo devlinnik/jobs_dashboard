@@ -4,7 +4,7 @@ const $$ = (q, root = document) => [...root.querySelectorAll(q)];
 const paths = {
   grid: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
   activity: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
-  settings: '<path d="m9 3-1 3-3 1 1 3-2 2 2 2-1 3 3 1 1 3h6l1-3 3-1-1-3 2-2-2-2 1-3-3-1-1-3z"/><circle cx="12" cy="12" r="3"/>',
+  settings: '<path d="M18.84 9.17 L19.22 10.40 L21.27 9.94 L21.27 14.06 L19.22 13.60 L18.84 14.83 L18.84 14.83 L18.24 15.98 L20.01 17.10 L17.10 20.01 L15.98 18.24 L14.83 18.84 L14.83 18.84 L13.60 19.22 L14.06 21.27 L9.94 21.27 L10.40 19.22 L9.17 18.84 L9.17 18.84 L8.02 18.24 L6.90 20.01 L3.99 17.10 L5.76 15.98 L5.16 14.83 L5.16 14.83 L4.78 13.60 L2.73 14.06 L2.73 9.94 L4.78 10.40 L5.16 9.17 L5.16 9.17 L5.76 8.02 L3.99 6.90 L6.90 3.99 L8.02 5.76 L9.17 5.16 L9.17 5.16 L10.40 4.78 L9.94 2.73 L14.06 2.73 L13.60 4.78 L14.83 5.16 L14.83 5.16 L15.98 5.76 L17.10 3.99 L20.01 6.90 L18.24 8.02 L18.84 9.17 Z"/><circle cx="12" cy="12" r="3.2"/>',
   lock: '<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><path d="M12 14v3"/>',
   bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
@@ -460,8 +460,7 @@ async function loadSettings() {
   await loadProfiles();
   settings = await api('/settings'); const form = $('#settings-form'); form.reset();
   Object.entries(settings).forEach(([key,value])=>{ const field = form.elements.namedItem(key); if (!field) return; if (field.type === 'checkbox') field.checked = Boolean(value); else field.value = value; });
-  $('#bot-status').className = 'badge ' + (settings.telegram_configured ? 'good' : 'neutral');
-  $('#bot-status').textContent = settings.telegram_configured ? 'Токен сохранён' : 'Не подключён';
+  renderTelegramStatus(settings.telegram_status);
   $('#token-hint').textContent = settings.telegram_configured ? 'Токен сохранён. Оставьте поле пустым, чтобы не менять.' : 'Создайте бота через @BotFather.';
   $('#pin-status').className = 'badge ' + (settings.pin_enabled ? 'good' : 'neutral');
   $('#pin-status').textContent = settings.pin_enabled ? 'Включена' : 'Выключена';
@@ -469,6 +468,20 @@ async function loadSettings() {
   $('#current-pin-field').hidden = !settings.pin_enabled;
   form.elements.disable_pin.disabled = !settings.pin_enabled;
 }
+function renderTelegramStatus(status = {}) {
+  const state = status.state || (settings.telegram_configured ? 'pending' : 'unconfigured');
+  $('#bot-status').className = 'badge ' + (['ready','token_ok'].includes(state) ? 'good' : ['error','recipient_error'].includes(state) ? 'warning' : 'neutral');
+  $('#bot-status').textContent = {ready:'Бот доступен',token_ok:'Токен действителен',error:'Ошибка проверки',recipient_error:'Проверьте получателя',pending:'Не проверен',unconfigured:'Не подключён'}[state] || 'Не проверен';
+  $('#telegram-status-info').textContent = [status.bot_username ? 'Бот: @' + status.bot_username : '', status.message || (settings.telegram_configured ? 'Токен сохранён. Проверьте подключение.' : 'Сохраните токен и получателя.'), status.chat_id ? `Получатель: ${status.recipient_label || settings.telegram_chat} · Chat ID ${status.chat_id}` : '', status.checked_at ? 'Проверено: ' + fullDate(status.checked_at) : ''].filter(Boolean).join('\n');
+}
+async function checkTelegramStatus() {
+  $('#bot-status').textContent = 'Проверяем…'; $('#telegram-status-info').textContent = 'Проверяем токен и получателя в Telegram…';
+  try {
+    const status = await api('/telegram/status', {method:'POST'});
+    settings.telegram_status = status; renderTelegramStatus(status);
+  } catch (error) { renderTelegramStatus({state:'error',message:error.message}); }
+}
+$('#check-telegram').onclick = event => busy(event.currentTarget, checkTelegramStatus);
 $('#settings-form').addEventListener('submit', event => {
   event.preventDefault(); const form = event.currentTarget;
   busy($('button[type=submit]', form), async () => {
@@ -477,6 +490,7 @@ $('#settings-form').addEventListener('submit', event => {
     if (!data.pin) delete data.pin;
     if (!data.telegram_token) delete data.telegram_token;
     await api('/settings', {method:'PUT',body:data}); await loadSettings(); toast('Настройки сохранены');
+    if (settings.telegram_configured && (data.telegram_token || !settings.telegram_status?.checked_at)) await checkTelegramStatus();
   });
 });
 $('#test-telegram').onclick = event => busy(event.currentTarget, async () => {

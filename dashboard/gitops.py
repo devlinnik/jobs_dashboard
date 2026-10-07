@@ -6,7 +6,7 @@ import shlex
 import stat
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
-from .remote import RemoteError
+from .remote import RemoteError, command_failure
 from .gitprovider import Provider, repository_path
 
 EXCLUDED_DIRS = {'.git', '.ssh', '.venv', 'venv', 'node_modules', 'vendor', '__pycache__', '.idea'}
@@ -135,8 +135,26 @@ def snapshot(conn, raw, files, head=''):
     hashes = ''
     for start in range(0, len(paths), 100):
         batch = paths[start:start + 100]
-        command = 'for f in ' + ' '.join(shlex.quote(p) for p in batch) + '; do if test -f "$f" || test -L "$f"; then git hash-object -- "$f" || exit; else printf "deleted\\n"; fi; done'
-        hashes += conn.text(command)
+        # Fingerprint raw bytes, not clean-filter output. A symlink stores its target
+        # string in Git; never read the target file or traverse a linked directory.
+        # The sentinel preserves trailing newlines through shell substitution.
+        command = 'devlin_file_index=0; for f in ' + ' '.join(shlex.quote(p) for p in batch) + '; do '
+        command += ('devlin_file_index=$((devlin_file_index + 1)); '
+            'if test -L "$f"; then '
+            'if devlin_link=$(readlink -- "$f" && printf "."); then '
+            'printf "link:"; printf "%s" "$devlin_link" | LC_ALL=C git hash-object --stdin; '
+            'devlin_hash_code=$?; else devlin_hash_code=$?; fi; '
+            'elif test -f "$f"; then printf "file:"; LC_ALL=C git hash-object --no-filters -- "$f"; devlin_hash_code=$?; '
+            'elif test -e "$f"; then printf "other\\n"; devlin_hash_code=0; '
+            'else printf "deleted\\n"; devlin_hash_code=0; fi; '
+            'if test "$devlin_hash_code" -ne 0; then printf "\\nDEVLIN_HASH_ERROR:%s\\n" "$devlin_file_index"; exit "$devlin_hash_code"; fi; done')
+        code, out, err = conn.run(command)
+        if code:
+            match = re.search(rb'\nDEVLIN_HASH_ERROR:(\d+)\n', out)
+            index = int(match.group(1)) - 1 if match else -1
+            path = batch[index] if 0 <= index < len(batch) else '(пакет файлов)'
+            raise command_failure(code, err, 'Проверка содержимого файла «' + path + '»')
+        hashes += out.decode('utf-8', errors='replace')
     return hashlib.sha256((conn.path + '\0' + head + raw + hashes).encode()).hexdigest()
 
 
@@ -247,6 +265,11 @@ def diagnostics(conn, settings):
     if not current['connected']:
         checks.append({'ok': False, 'message': 'В корне проекта ещё нет Git-репозитория.'})
         return {'checks': checks}
+    try:
+        snapshot(conn, json.dumps(current['files'], sort_keys=True), current['files'], current['head'])
+        checks.append({'ok': True, 'message': 'Предварительная проверка содержимого изменённых файлов прошла. Символические ссылки проверяются без чтения их целей.'})
+    except RemoteError as exc:
+        checks.append({'ok': False, 'message': str(exc)})
     author = author_identity(conn, settings)
     checks.append({'ok': bool(author['name'] and author['email']), 'message': 'Автор: ' + author['name'] + ' <' + author['email'] + '> · ' + author['source']})
     for part in ('', 'objects', 'refs'):
@@ -360,13 +383,15 @@ def commit(conn, current, files, message, settings, push=False):
         if item['path'] in files and item.get('old_path'):
             paths.append(item['old_path'])
     for start in range(0, len(paths), 100):
-        conn.text('LC_ALL=C git --literal-pathspecs add -A -- ' + ' '.join(shlex.quote(p) for p in paths[start:start + 100]))
+        batch = paths[start:start + 100]
+        conn.text('LC_ALL=C git --literal-pathspecs add -A -- ' + ' '.join(shlex.quote(p) for p in batch),
+                  context='Добавление файлов в индекс Git: ' + ', '.join(batch[:5]) + (' …' if len(batch) > 5 else ''))
     # If a hook fails, do not undo the server index or overwrite the user's work.
     environment = ' '.join(key + '=' + shlex.quote(value) for key,value in (
         ('GIT_AUTHOR_NAME',identity['name']), ('GIT_AUTHOR_EMAIL',identity['email']),
         ('GIT_COMMITTER_NAME',identity['name']), ('GIT_COMMITTER_EMAIL',identity['email'])))
     conn.text('LC_ALL=C ' + environment + ' git -c user.name=' + shlex.quote(identity['name']) + ' -c user.email=' + shlex.quote(identity['email']) +
-              ' commit -m ' + shlex.quote(message), timeout=90)
+              ' commit -m ' + shlex.quote(message), timeout=90, context='Создание коммита из подготовленных файлов')
     head = conn.text('git rev-parse --short HEAD').strip()
     result = {'commit': head, 'pushed': False, 'warning': '', 'author': identity}
     if push:

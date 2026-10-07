@@ -187,7 +187,7 @@ class Store:
 
     def settings(self):
         defaults = {'telegram_token': '', 'telegram_chat': '', 'pin_hash': '',
-                    'git_name': 'Devlin Desk', 'git_email': 'desk@localhost', 'notify_recovery': True}
+                    'git_name': 'Devlin Desk', 'git_email': 'desk@localhost', 'notify_recovery': True, 'telegram_status': {}}
         with self.lock:
             row = self.db.execute('SELECT data FROM settings WHERE id=1').fetchone()
             return defaults | (json.loads(row[0]) if row else {})

@@ -65,6 +65,7 @@ def main():
         else: raise AssertionError('UI server did not start')
         server_files = temp/'server'; server_files.mkdir()
         (server_files/'index.php').write_text('<?php echo "Initial";')
+        (server_files/'hosting-link').symlink_to('missing-target')
         (server_files/'cache').mkdir(); (server_files/'cache/result.txt').write_text('keep ignored')
         (server_files/'server.log').write_text('keep log')
         bare = git_host['bare']
@@ -77,7 +78,7 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            expect(page.locator('#app-version')).to_have_text('v1.8.0')
+            expect(page.locator('#app-version')).to_have_text('v1.9.0')
             assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == 'light'
             assert page.evaluate("parseFloat(getComputedStyle(document.body).fontSize)") >= 16
             page.locator('[data-nav=ssh-profiles]').click()
@@ -194,7 +195,7 @@ def main():
             expect(page.locator('#detail-content')).to_contain_text('ОСТАТОК ТАРИФА ХОСТИНГА · ОЦЕНКА', timeout=20000)
             expect(page.locator('#detail-content')).to_contain_text('лимит: 10 ГБ', timeout=20000)
             expect(page.locator('#detail-content')).to_contain_text('Точная квота — в панели хостинга.')
-            page.screenshot(path=str(screenshot/'hosting-quota.png'), animations='disabled')
+            page.screenshot(path=str(screenshot/'hosting-quota.png, telegram-settings.png'), animations='disabled')
             page.locator('[data-tab=git]').click()
             expect(page.locator('#gitignore-status')).to_contain_text('Файл отсутствует', timeout=20000)
             page.locator('[data-git-action=ignore]').click()
@@ -211,12 +212,12 @@ def main():
             page.locator('#gitignore-add').click()
             expect(page.locator('#gitignore-content')).to_have_value('# Server project rules\n/cache/\n/server.log\n')
             screenshot = ROOT/'test-results'; screenshot.mkdir(exist_ok=True)
-            page.screenshot(path=str(screenshot/'gitignore-editor.png, hosting-quota.png'), animations='disabled')
+            page.screenshot(path=str(screenshot/'gitignore-editor.png, hosting-quota.png, telegram-settings.png'), animations='disabled')
             page.locator('#gitignore-save').click(); page.locator('#confirm-accept').click()
             expect(page.locator('#gitignore-dialog')).not_to_be_visible(timeout=20000)
             expect(page.locator('#gitignore-status')).to_contain_text('Файл существует', timeout=20000)
             assert (server_files/'cache/result.txt').read_text() == 'keep ignored'
-            expect(page.locator('.git-file')).to_have_count(2)
+            expect(page.locator('.git-file')).to_have_count(3)
             page.locator('[data-git-action=ignore]').click()
             expect(page.locator('#gitignore-content')).to_be_enabled(timeout=20000)
             assert '# Server project rules' in page.locator('#gitignore-content').input_value()
@@ -254,13 +255,14 @@ def main():
             expect(page.locator('#outgoing-commits')).to_contain_text('Browser Author')
             assert subprocess.run(['git','-C',str(bare),'rev-parse','--verify','main'],capture_output=True).returncode != 0
             assert_toast_above_dialog(page, '#detail-dialog', 'создан на сервере')
-            page.screenshot(path=str(screenshot/'git-outgoing.png, gitignore-editor.png, hosting-quota.png'), animations='disabled')
+            page.screenshot(path=str(screenshot/'git-outgoing.png, gitignore-editor.png, hosting-quota.png, telegram-settings.png'), animations='disabled')
             page.locator('#git-history-panel [data-git-action=push]').click()
             expect(page.locator('#confirm-dialog')).to_be_visible()
             expect(page.locator('#confirm-extra')).to_contain_text('Browser Author')
             page.locator('#confirm-accept').click()
             expect(page.locator('#outgoing-commits')).to_have_count(0, timeout=20000)
             assert subprocess.check_output(['git','-C',str(bare),'show','main:index.php']).decode() == '<?php echo "Initial";'
+            assert subprocess.check_output(['git','-C',str(bare),'show','main:hosting-link']).decode() == 'missing-target'
             page.screenshot(path=str(screenshot/'git-notification.png'), animations='disabled')
             (server_files/'index.php').write_text('<?php echo "Updated on server";')
             page.locator('[data-git-action=refresh]').click()
@@ -292,6 +294,26 @@ def main():
             page.screenshot(path=str(screenshot/'dashboard.png'),full_page=True, animations='disabled')
             page.locator('[data-nav=settings]').click()
             expect(page.locator('#settings-form')).to_be_visible()
+            assert page.locator('.topbar .user-avatar').count() == 0
+            gear = page.locator('[data-nav=settings] svg')
+            box = gear.bounding_box(); assert abs(box['width'] - box['height']) < 1
+            status_requests = []
+            def bot_status(route):
+                status_requests.append(route.request.method)
+                route.fulfill(json={'state':'ready','bot_username':'desk_test_bot','chat_id':12345,
+                    'recipient_label':'Browser Recipient','message':'Бот доступен, получатель найден.',
+                    'checked_at':'2026-10-07T12:00:00Z'})
+            page.route('**/api/telegram/status', bot_status)
+            page.locator('#settings-form [name=telegram_token]').fill('123456:UI_TEST_TOKEN')
+            page.locator('#settings-form [name=telegram_chat]').fill('browser_recipient')
+            page.locator('#settings-form button[type=submit]').click()
+            expect(page.locator('#bot-status')).to_have_text('Бот доступен', timeout=20000)
+            expect(page.locator('#telegram-status-info')).to_contain_text('@desk_test_bot')
+            expect(page.locator('#settings-form [name=telegram_chat]')).to_have_value('@browser_recipient')
+            assert status_requests == ['POST']
+            assert page.locator('#settings-form [name=telegram_token]').input_value() == ''
+            page.screenshot(path=str(screenshot/'telegram-settings.png'), animations='disabled')
+
             page.locator('#settings-form [name=pin]').fill('1234')
             page.locator('#settings-form button[type=submit]').click()
             expect(page.locator('#pin-status')).to_have_text('Включена')
@@ -318,7 +340,7 @@ def main():
                 assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), f'Horizontal overflow at {width}px'
             assert errors == [], errors
             browser.close()
-            print('UI smoke passed: light theme, larger fonts, clickable notifications above nested modals, project scrolling, SSH/Git profiles, provider authorization, repository picker/attach/access check, hosting tariff/shared root/SSH picker, Git diagnostics, visual .gitignore creation/editing/picker, profile author, local commits/outgoing history/separate HTTPS Git push, SFTP, CRUD, diff/commit, journal, filters, PIN, XSS, responsive layout. Screenshots: test-results/dashboard.png, ssh-browser.png, git-profiles.png, git-notification.png, git-outgoing.png, gitignore-editor.png, hosting-quota.png')
+            print('UI smoke passed: Telegram nickname/automatic bot status (mocked), square gear/no decorative avatar, first commit with dangling symlink, light theme, larger fonts, clickable notifications above nested modals, project scrolling, SSH/Git profiles, provider authorization, repository picker/attach/access check, hosting tariff/shared root/SSH picker, Git diagnostics, visual .gitignore creation/editing/picker, profile author, local commits/outgoing history/separate HTTPS Git push, SFTP, CRUD, diff/commit, journal, filters, PIN, XSS, responsive layout. Screenshots: test-results/dashboard.png, ssh-browser.png, git-profiles.png, git-notification.png, git-outgoing.png, gitignore-editor.png, hosting-quota.png, telegram-settings.png')
 
 
 if __name__ == '__main__': main()

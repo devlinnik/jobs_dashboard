@@ -42,6 +42,45 @@ class PinnedKey(paramiko.MissingHostKeyPolicy):
             raise RemoteError('Ключ SSH-сервера изменился. Подключение остановлено; проверьте отпечаток.')
 
 
+def command_failure(code, err, context=''):
+    # Git output may include a credential-bearing configured remote; do not return raw stderr.
+    text = err.decode('utf-8', errors='replace').lower()
+    reason = 'Проверьте Git/SSH-права и состояние проекта на сервере.'
+    if 'disk quota exceeded' in text or 'no space left on device' in text:
+        reason = 'Исчерпана квота хостинга или место на диске. Проверьте тариф в панели хостинга; освободите место перед повтором. Размер общего диска не показывает квоту аккаунта.'
+    elif 'detected dubious ownership' in text or 'unsafe repository' in text:
+        reason = 'Git не доверяет владельцу папки (safe.directory). Проверьте владельца и SSH-пользователя. Для доверенного проекта добавьте только его абсолютный путь в safe.directory через SSH; не используйте *. '
+    elif 'index.lock' in text and ('exists' in text or 'unable to create' in text):
+        reason = 'Git не может создать .git/index.lock: другая Git-операция, оставшаяся блокировка или нет прав записи. Проверьте диагностику. Блокировка автоматически не удаляется.'
+    elif 'filter' in text and any(value in text for value in ('failed', 'cannot run', 'not found')):
+        reason = 'Не работает Git-фильтр файла. Проверьте .gitattributes, настройки filter.* и доступность его программы (например Git LFS) на сервере. При добавлении файлов приложение сохраняет правила Git-фильтров.'
+    elif any(s in text for s in ('author identity unknown', 'unable to auto-detect email', 'empty ident name', 'invalid author', 'empty ident email')):
+        reason = 'Git не смог определить автора. Заполните имя и email вместе в Git-профиле либо исправьте user.name/user.email на сервере.'
+    elif any(s in text for s in ('gpg failed', 'failed to write commit object', 'no secret key', 'cannot run gpg', 'could not sign')):
+        reason = 'Не удалось создать или подписать объект коммита. Проверьте квоту и права .git/objects, а также commit.gpgsign и ключ подписи на сервере. Изменения в индексе сохранены.'
+    elif 'read-only file system' in text or 'operation not permitted' in text:
+        reason = 'Файловая система или файлы Git недоступны для записи. Проверьте права и ограничения хостинга.'
+    elif 'non-fast-forward' in text or 'rejected' in text:
+        reason = 'Push отклонён: история веток разошлась или ветка защищена. Force push не выполняется.'
+    elif 'permission denied' in text or 'authentication failed' in text or 'insufficient permission' in text:
+        reason = 'Нет доступа. Проверьте SSH-пользователя, владельца и права записи .git, включая objects/refs; для сетевых операций — Git-профиль или SSH-ключ Git-хостинга.'
+    elif 'host key verification failed' in text:
+        reason = 'На сервере не подтверждён ключ Git-хостинга. Проверьте known_hosts через доверенный канал.'
+    elif 'could not resolve' in text:
+        reason = 'Не удалось разрешить имя Git-хостинга. Проверьте DNS и сеть сервера.'
+    elif 'command not found' in text or 'git: not found' in text:
+        reason = 'На сервере не установлен Git или нужная системная команда.'
+    elif 'no such file or directory' in text or "can't cd" in text or 'cannot cd' in text:
+        reason = ('Файл исчез или недоступен для чтения. Обновите список изменений и проверьте путь файла.'
+                  if context.startswith('Проверка содержимого файла') else
+                  'Папка проекта не найдена или недоступна. Выберите её через SSH-проводник.')
+    elif 'not a git repository' in text:
+        reason = 'В выбранной папке нет Git-репозитория. Подключите его в разделе Git.'
+    if code == 128:
+        reason += ' Откройте «Git & файлы → Диагностика Git»; полный вывод Git и квоту также можно проверить через SSH/панель хостинга.'
+    return RemoteError((context + ': ' if context else '') + 'Команда сервера завершилась с ошибкой (код %s). %s' % (code, reason))
+
+
 class Connection:
     def __init__(self, client, project):
         self.client = client
@@ -76,41 +115,10 @@ class Connection:
         finally:
             channel.close()
 
-    def text(self, command, **kwargs):
+    def text(self, command, *, context='', **kwargs):
         code, out, err = self.run(command, **kwargs)
         if code:
-            # Git output may include a credential-bearing configured remote; do not return raw stderr.
-            text = err.decode('utf-8', errors='replace').lower()
-            reason = 'Проверьте Git/SSH-права и состояние проекта на сервере.'
-            if 'disk quota exceeded' in text or 'no space left on device' in text:
-                reason = 'Исчерпана квота хостинга или место на диске. Проверьте тариф в панели хостинга; освободите место перед повтором. Размер общего диска не показывает квоту аккаунта.'
-            elif 'detected dubious ownership' in text or 'unsafe repository' in text:
-                reason = 'Git не доверяет владельцу папки (safe.directory). Проверьте владельца и SSH-пользователя. Для доверенного проекта добавьте только его абсолютный путь в safe.directory через SSH; не используйте *. '
-            elif 'index.lock' in text and ('exists' in text or 'unable to create' in text):
-                reason = 'Git не может создать .git/index.lock: другая Git-операция, оставшаяся блокировка или нет прав записи. Проверьте диагностику. Блокировка автоматически не удаляется.'
-            elif any(s in text for s in ('author identity unknown', 'unable to auto-detect email', 'empty ident name', 'invalid author', 'empty ident email')):
-                reason = 'Git не смог определить автора. Заполните имя и email вместе в Git-профиле либо исправьте user.name/user.email на сервере.'
-            elif any(s in text for s in ('gpg failed', 'failed to write commit object', 'no secret key', 'cannot run gpg', 'could not sign')):
-                reason = 'Не удалось создать или подписать объект коммита. Проверьте квоту и права .git/objects, а также commit.gpgsign и ключ подписи на сервере. Изменения в индексе сохранены.'
-            elif 'read-only file system' in text or 'operation not permitted' in text:
-                reason = 'Файловая система или файлы Git недоступны для записи. Проверьте права и ограничения хостинга.'
-            elif 'non-fast-forward' in text or 'rejected' in text:
-                reason = 'Push отклонён: история веток разошлась или ветка защищена. Force push не выполняется.'
-            elif 'permission denied' in text or 'authentication failed' in text or 'insufficient permission' in text:
-                reason = 'Нет доступа. Проверьте SSH-пользователя, владельца и права записи .git, включая objects/refs; для сетевых операций — Git-профиль или SSH-ключ Git-хостинга.'
-            elif 'host key verification failed' in text:
-                reason = 'На сервере не подтверждён ключ Git-хостинга. Проверьте known_hosts через доверенный канал.'
-            elif 'could not resolve' in text:
-                reason = 'Не удалось разрешить имя Git-хостинга. Проверьте DNS и сеть сервера.'
-            elif 'command not found' in text or 'git: not found' in text:
-                reason = 'На сервере не установлен Git или нужная системная команда.'
-            elif 'no such file or directory' in text or "can't cd" in text or 'cannot cd' in text:
-                reason = 'Папка проекта не найдена или недоступна. Выберите её через SSH-проводник.'
-            elif 'not a git repository' in text:
-                reason = 'В выбранной папке нет Git-репозитория. Подключите его в разделе Git.'
-            if code == 128:
-                reason += ' Откройте «Git & файлы → Диагностика Git»; полный вывод Git и квоту также можно проверить через SSH/панель хостинга.'
-            raise RemoteError('Команда сервера завершилась с ошибкой (код %s). %s' % (code, reason))
+            raise command_failure(code, err, context)
         return out.decode('utf-8', errors='replace')
 
     def check_directory(self):

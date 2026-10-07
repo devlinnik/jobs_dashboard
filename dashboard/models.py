@@ -185,8 +185,11 @@ class SettingsInput(BaseModel):
     @field_validator('telegram_chat')
     @classmethod
     def validate_chat(cls, value):
+        value = value.strip()
+        if value and not value.startswith('@') and not re.fullmatch(r'-?\d+', value):
+            value = '@' + value
         if value and not re.fullmatch(r'-?\d+|@[a-zA-Z0-9_]+', value):
-            raise ValueError('Chat ID: число или @имя канала')
+            raise ValueError('Получатель: Chat ID или @никнейм без пробелов и ссылок')
         return value
 
     @field_validator('telegram_token')

@@ -238,6 +238,8 @@ def create_app(directory=None, start_monitor=True):
             data['telegram_token'] = store.encrypt(body.telegram_token)
         if body.clear_telegram_token:
             data['telegram_token'] = ''
+        if (data['telegram_token'], data['telegram_chat']) != (old['telegram_token'], old['telegram_chat']):
+            data['telegram_status'] = {}
         if body.pin is not None:
             data['pin_hash'] = hash_pin(body.pin)
         if body.disable_pin:
@@ -249,10 +251,14 @@ def create_app(directory=None, start_monitor=True):
         store.event(None, 'info', 'Настройки приложения сохранены')
         return public_settings(data)
 
+    @app.post('/api/telegram/status', dependencies=auth)
+    async def check_telegram_status():
+        return await monitor.verify_telegram()
+
     @app.post('/api/telegram/test', dependencies=auth)
     async def telegram_test():
         if not await monitor.telegram('✅ Devlin Desk: тестовое уведомление. Бот подключён.'):
-            raise HTTPException(400, 'Сообщение не отправлено. Сохраните токен и Chat ID, откройте диалог с ботом и проверьте сеть.')
+            raise HTTPException(400, 'Сообщение не отправлено. Нажмите «Проверить бота», проверьте получателя, /start и права отправки; подробности — в журнале событий.')
         store.event(None, 'success', 'Тестовое уведомление Telegram отправлено')
         return {'message': 'Сообщение отправлено в Telegram'}
 

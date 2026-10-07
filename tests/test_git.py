@@ -92,6 +92,86 @@ def test_real_git_selective_commit_preserves_unselected_files(repo):
 
 
 @POSIX_ONLY
+def test_snapshot_hashes_links_without_reading_targets_and_commits_first_import(tmp_path):
+    work = tmp_path/'project'; work.mkdir()
+    git(work,'init','-b','main')
+    outside = tmp_path/'outside'; outside.mkdir()
+    (outside/'private.txt').write_text('do not fingerprint target content')
+    (work/'broken-link').symlink_to('missing-target')
+    (work/'directory-link').symlink_to(outside, target_is_directory=True)
+    conn = LocalConnection(work)
+    before = gitops.status(conn)
+    assert {f['path'] for f in before['files']} == {'broken-link','directory-link'}
+    (outside/'private.txt').write_text('target changed independently')
+    assert gitops.status(conn)['snapshot'] == before['snapshot']
+    (work/'broken-link').unlink(); (work/'broken-link').symlink_to('another-missing-target')
+    after = gitops.status(conn)
+    assert after['snapshot'] != before['snapshot']
+    request = SimpleNamespace(snapshot=after['snapshot'],files=['broken-link','directory-link'],message='Links',push=False)
+    result = gitops.sync(conn,request,{'git_name':'Desk','git_email':'desk@example.com'})
+    assert result['commit'] and not result['pushed']
+    assert git(work,'show','HEAD:broken-link') == 'another-missing-target'
+    assert git(work,'show','HEAD:directory-link') == str(outside)
+    assert 'private.txt' not in git(work,'ls-tree','-r','--name-only','HEAD')
+
+
+@POSIX_ONLY
+def test_snapshot_retains_trailing_newlines_in_link_target(tmp_path):
+    git(tmp_path,'init','-b','main')
+    link = tmp_path/'link'; link.symlink_to('missing\n')
+    conn = LocalConnection(tmp_path)
+    before = gitops.status(conn)['snapshot']
+    link.unlink(); link.symlink_to('missing')
+    assert gitops.status(conn)['snapshot'] != before
+
+
+@POSIX_ONLY
+def test_snapshot_does_not_run_clean_filters_but_staging_reports_failure(tmp_path):
+    git(tmp_path,'init','-b','main')
+    (tmp_path/'.gitattributes').write_text('index.php filter=broken\n')
+    (tmp_path/'index.php').write_text('server content')
+    git(tmp_path,'config','filter.broken.clean','echo SECRET_TOKEN >&2; exit 128')
+    git(tmp_path,'config','filter.broken.required','true')
+    conn = LocalConnection(tmp_path)
+    state = gitops.status(conn)
+    assert state['snapshot']  # Raw preview must not execute the filter.
+    with pytest.raises(RemoteError,match='Добавление файлов в индекс Git: index.php') as error:
+        gitops.sync(conn,SimpleNamespace(snapshot=state['snapshot'],files=['index.php'],message='Commit',push=False),
+                    {'git_name':'Desk','git_email':'desk@example.com'})
+    assert 'Git-фильтр' in str(error.value) and 'SECRET_TOKEN' not in str(error.value)
+    assert (tmp_path/'index.php').read_text() == 'server content'
+
+
+@POSIX_ONLY
+def test_snapshot_error_identifies_file_and_preserves_staged_changes(repo):
+    work, original = repo
+    (work/'index.php').write_text('staged edits'); git(work,'add','index.php')
+    class Unreadable(LocalConnection):
+        def run(self, command, **kwargs):
+            if 'DEVLIN_HASH_ERROR' in command:
+                return 128, b'file:\nDEVLIN_HASH_ERROR:1\n', b'fatal: permission denied SECRET_TOKEN'
+            return super().run(command, **kwargs)
+    with pytest.raises(RemoteError,match='Проверка содержимого файла «index.php»') as error:
+        gitops.status(Unreadable(work))
+    assert 'SECRET_TOKEN' not in str(error.value)
+    assert git(work,'diff','--cached','--name-only') == 'index.php'
+
+
+@POSIX_ONLY
+def test_commit_hook_failure_reports_stage_and_keeps_index(repo):
+    work, conn = repo
+    hook = work/'.git/hooks/pre-commit'; hook.write_text('#!/bin/sh\necho SECRET_TOKEN >&2\nexit 128\n'); hook.chmod(0o755)
+    (work/'index.php').write_text('server edits')
+    state = gitops.status(conn)
+    with pytest.raises(RemoteError,match='Создание коммита из подготовленных файлов') as error:
+        gitops.sync(conn,SimpleNamespace(snapshot=state['snapshot'],files=['index.php'],message='Commit',push=False),
+                    {'git_name':'Desk','git_email':'desk@example.com'})
+    assert 'SECRET_TOKEN' not in str(error.value)
+    assert git(work,'diff','--cached','--name-only') == 'index.php'
+    assert git(work,'log','-1','--format=%s') == 'initial'
+
+
+@POSIX_ONLY
 def test_snapshot_detects_content_changes_and_staged_is_preserved(repo):
     work, conn = repo
     (work/'index.php').write_text('v2')

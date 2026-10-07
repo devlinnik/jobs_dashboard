@@ -7,6 +7,7 @@ import time
 from types import SimpleNamespace
 import httpx
 from . import gitops
+from . import telegram as telegram_api
 from .remote import connect, RemoteError
 from .store import now
 
@@ -38,6 +39,11 @@ class Monitor:
         self.semaphore = asyncio.Semaphore(3)
         self.http = httpx.AsyncClient(timeout=15, follow_redirects=True, trust_env=True)
         self.running = set()
+        self.telegram_lock = asyncio.Lock()
+
+    async def verify_telegram(self):
+        async with self.telegram_lock:
+            return await telegram_api.verify(self.store, self.http)
 
     async def telegram(self, text):
         settings = self.store.settings()
@@ -45,14 +51,19 @@ class Monitor:
         if not token or not settings['telegram_chat']:
             return False
         try:
-            response = await self.http.post('https://api.telegram.org/bot' + token + '/sendMessage',
-                    json={'chat_id': settings['telegram_chat'], 'text': text[:4000], 'disable_web_page_preview': True})
-            if response.status_code != 200 or response.json().get('ok') is not True:
-                self.store.event(None, 'error', 'Telegram: сообщение не отправлено. Проверьте токен, Chat ID и права бота.')
-                return False
+            destination = settings['telegram_chat']
+            if destination.startswith('@'):
+                status = settings.get('telegram_status', {})
+                if status.get('state') != 'ready' or not isinstance(status.get('chat_id'), int):
+                    status = await self.verify_telegram()
+                if status.get('state') != 'ready':
+                    raise telegram_api.TelegramError(status.get('message', 'Сначала проверьте получателя.'))
+                destination = status['chat_id']
+            await telegram_api.request(self.http, token, 'sendMessage',
+                {'chat_id': destination, 'text': text[:4000], 'disable_web_page_preview': True})
             return True
-        except (httpx.HTTPError, ValueError):
-            self.store.event(None, 'error', 'Telegram: соединение не удалось. Проверьте сеть.')
+        except telegram_api.TelegramError as exc:
+            self.store.event(None, 'error', 'Telegram: ' + str(exc))
             return False
 
     async def loop(self):
