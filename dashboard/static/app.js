@@ -32,6 +32,7 @@ const fullDate = value => value ? new Date(value).toLocaleString('ru-RU', {day:'
 const bytes = value => value == null ? '—' : value >= 1024 ** 3 ? (value / 1024 ** 3).toFixed(1) + ' ГБ' : (value / 1024 ** 2).toFixed(0) + ' МБ';
 let projects = [], settings = {}, page = 'projects', selectedId = null, activeTab = 'overview', gitData = null, loggedIn = false, loadingProjects = false, pinEnabled = false;
 let sshProfiles = [], remoteProjectId = null, remoteProfileId = '', remoteEndpoint = '', remoteCurrent = '', remoteParent = null, remoteRequest = 0, probeProjectId = null;
+let gitHistory = null, gitHistoryRequest = 0;
 let gitProfiles = [], gitConnectState = null, repositoryPage = 1, repositoryItems = [], repositoryRequest = 0;
 
 async function api(path, options = {}) {
@@ -257,21 +258,23 @@ async function detailAction(action) {
 }
 
 async function loadGit() {
+  gitHistoryRequest++;
   const id = selectedId, p = getProject(); gitData = null;
   if (!p.ssh_host) { $('#detail-content').innerHTML = '<div class="git-info">Для работы с файлами сервера сначала настройте SSH и подтвердите ключ сервера в разделе «Обзор».</div><button class="button secondary" data-detail-action="edit">Настроить SSH</button>'; return; }
   $('#detail-content').innerHTML = '<div class="loading">Читаем состояние репозитория на сервере…</div>';
   try {
     const data = await api(`/projects/${id}/git`);
     if (id !== selectedId || activeTab !== 'git') return;
-    gitData = data; renderGit();
+    gitData = data; gitHistory = null; renderGit(); await loadGitHistory(true);
   } catch (error) {
     if (id === selectedId && activeTab === 'git') $('#detail-content').innerHTML = `<div class="error-panel">${escape(error.message)}<br><button class="button secondary" data-detail-action="edit">Настроить подключение</button> <button class="button secondary" data-detail-action="git">Повторить</button></div>`;
   }
 }
 function renderGit() {
   const g = gitData, p = getProject();
-  $('#detail-content').innerHTML = `<div class="git-heading"><div><h3>${g.connected ? escape(g.branch) : 'Подключите репозиторий'}</h3><p>${g.connected ? escape(g.remote || 'origin не настроен') + (g.head ? ' · ' + escape(g.head) : '') : 'Файлы проекта уже на сервере. Выберите их для первого коммита.'}</p></div><div class="detail-actions" style="margin:0"><button class="button secondary small" data-git-action="refresh">${icon('refresh')}Обновить</button>${g.connected ? `<button class="button secondary small" data-git-action="pull">${icon('git')}Загрузить из Git</button><button class="button secondary small" data-git-action="push">${icon('send')}Отправить коммиты</button>` : ''}</div></div><div class="git-info">${g.connected ? 'Отметьте файлы, проверьте diff и создайте коммит из текущих файлов на сервере. Push отправит его в текущую ветку origin, в том числе в GitLab.' : 'Создайте пустой репозиторий в GitLab или GitHub, затем выберите его через «Подключить репозиторий». Для первого импорта удалённый репозиторий должен быть пустым. Git-профиль либо доступы сервера должны разрешать запись.'}</div>${g.staged ? '<div class="git-info git-warning">В индексе уже есть staged-изменения. Завершите или отмените их на сервере: приложение не будет включать их в свой коммит.</div>' : ''}${g.files.some(f=>!f.allowed) ? '<div class="git-info git-warning">Потенциально секретные файлы и зависимости исключены из синхронизации. Проверяйте содержимое разрешённых файлов — фильтр имени не обнаруживает все секреты.</div>' : ''}${!g.connected ? `<div class="fields"><label>URL репозитория<input id="git-remote" placeholder="git@gitlab.com:group/project.git"></label><label>Начальная ветка<input id="git-branch" value="${escape(p.git_branch || 'main')}" placeholder="main"></label></div>` : ''}${g.files.length ? `<div class="file-list"><div class="file-row"><label><input type="checkbox" id="select-all-files" checked><span>Выбрать все допустимые файлы (${g.files.filter(f=>f.allowed).length})</span></label></div>${g.files.map(f=>`<div class="file-row ${f.allowed ? '' : 'blocked'}"><label><input class="git-file" type="checkbox" value="${escape(f.path)}" ${f.allowed ? 'checked' : 'disabled'}><span class="file-status">${escape(f.status)}</span><span class="file-name" title="${escape(f.path)}">${escape(f.path)}</span></label>${f.allowed ? `<button class="view-diff" data-file-diff="${escape(f.path)}">Посмотреть →</button>` : '<span class="badge warning">Исключён</span>'}</div>`).join('')}</div><div class="git-controls"><label>Сообщение коммита<input id="commit-message" value="${g.connected ? 'Обновление файлов проекта' : 'Initial project import'}" maxlength="500" required></label><button class="button primary" data-git-action="commit" ${g.staged ? 'disabled' : ''}>${icon('git')}${g.connected ? 'Создать коммит' : 'Подключить и выгрузить'}</button></div><label class="check-line"><input id="commit-push" type="checkbox" checked><span>Отправить коммит в origin после создания</span></label><pre id="file-diff" class="diff-view" hidden></pre>` : '<div class="events-empty">Рабочая директория чистая. Изменений для коммита нет.</div>'}<p class="hint">Без force push, reset или перезаписи файлов. «Загрузить из Git» использует pull --ff-only и требует чистую рабочую директорию. Изменившийся после просмотра набор файлов потребует нового подтверждения.</p>`;
+  $('#detail-content').innerHTML = `<div class="git-heading"><div><h3>${g.connected ? escape(g.branch) : 'Подключите репозиторий'}</h3><p>${g.connected ? escape(g.remote || 'origin не настроен') + (g.head ? ' · ' + escape(g.head) : '') : 'Файлы проекта уже на сервере. Выберите их для первого коммита.'}</p></div><div class="detail-actions" style="margin:0"><button class="button secondary small" data-git-action="refresh">${icon('refresh')}Обновить</button>${g.connected ? `<button class="button secondary small" data-git-action="pull">${icon('git')}Загрузить из Git</button><button class="button secondary small" data-git-action="push">${icon('send')}Отправить коммиты</button>` : ''}</div></div><div class="git-info">${g.connected ? 'Отметьте файлы, проверьте diff и создайте коммит из текущих файлов на сервере. Push отправит его в текущую ветку origin, в том числе в GitLab.' : 'Создайте пустой репозиторий в GitLab или GitHub, затем выберите его через «Подключить репозиторий». Для первого импорта удалённый репозиторий должен быть пустым. Git-профиль либо доступы сервера должны разрешать запись.'}</div>${g.staged ? '<div class="git-info git-warning">В индексе уже есть staged-изменения. Завершите или отмените их на сервере: приложение не будет включать их в свой коммит.</div>' : ''}${g.files.some(f=>!f.allowed) ? '<div class="git-info git-warning">Потенциально секретные файлы и зависимости исключены из синхронизации. Проверяйте содержимое разрешённых файлов — фильтр имени не обнаруживает все секреты.</div>' : ''}${!g.connected ? `<div class="fields"><label>URL репозитория<input id="git-remote" placeholder="git@gitlab.com:group/project.git"></label><label>Начальная ветка<input id="git-branch" value="${escape(p.git_branch || 'main')}" placeholder="main"></label></div>` : ''}${g.files.length ? `<div class="file-list"><div class="file-row"><label><input type="checkbox" id="select-all-files" checked><span>Выбрать все допустимые файлы (${g.files.filter(f=>f.allowed).length})</span></label></div>${g.files.map(f=>`<div class="file-row ${f.allowed ? '' : 'blocked'}"><label><input class="git-file" type="checkbox" value="${escape(f.path)}" ${f.allowed ? 'checked' : 'disabled'}><span class="file-status">${escape(f.status)}</span><span class="file-name" title="${escape(f.path)}">${escape(f.path)}</span></label>${f.allowed ? `<button class="view-diff" data-file-diff="${escape(f.path)}">Посмотреть →</button>` : '<span class="badge warning">Исключён</span>'}</div>`).join('')}</div><div class="git-controls"><label>Сообщение коммита<input id="commit-message" value="${g.head ? 'Обновление файлов проекта' : 'Initial project import'}" maxlength="500" required></label><button class="button primary" data-git-action="commit" ${g.staged ? 'disabled' : ''}>${icon('git')}${g.connected ? 'Создать коммит' : 'Подключить и создать коммит'}</button></div><p class="hint">Коммит будет создан на сервере. Отправка выполняется отдельно из списка неотправленных коммитов.</p><pre id="file-diff" class="diff-view" hidden></pre>` : '<div class="events-empty">Рабочая директория чистая. Изменений для коммита нет.</div>'}<p class="hint">Без force push, reset или перезаписи файлов. «Загрузить из Git» использует pull --ff-only и требует чистую рабочую директорию. Изменившийся после просмотра набор файлов потребует нового подтверждения.</p>`;
   $('#detail-content').insertAdjacentHTML('afterbegin', `<section class="git-profile-summary"><p class="hint">${p.git_profile_id ? 'Git-профиль: ' + escape(p.git_profile_name || 'Выбран') + ' · HTTPS авторизация с ПК' : 'Авторизация Git настроена на SSH-сервере'}<br>${g.connected ? 'Локальный Git обнаружен' : 'Локальный Git не создан'} · ${g.remote ? 'origin настроен' : 'репозиторий сервиса не подключён'}</p><div class="detail-actions"><button class="button secondary" data-git-action="check">Проверить репозиторий</button><button class="button secondary" data-git-action="attach">${g.remote ? 'Настроить подключение репозитория' : 'Подключить репозиторий'}</button></div></section>`);
+  $('#detail-content').insertAdjacentHTML('beforeend', '<section id="git-history-panel" class="git-history-panel"><p class="hint">Загружаем коммиты…</p></section>');
   $('#select-all-files')?.addEventListener('change', event => $$('.git-file:not(:disabled)').forEach(box => box.checked = event.target.checked));
 }
 $('#detail-content').addEventListener('click', event => {
@@ -286,23 +289,58 @@ $('#detail-content').addEventListener('click', event => {
 });
 async function gitAction(action) {
   if (action === 'refresh') return loadGit();
+  if (action === 'fetch-commits') return loadGitHistory(true);
   const p = getProject(), id = p.id;
   if (action === 'check') { const result = await api(`/projects/${id}/git/check`, {method:'POST'}); toast(result.message, !result.ok); return; }
   if (action === 'attach') return openGitConnect();
-  if (action === 'pull' || action === 'push') {
+  if (action === 'push') {
+    await loadGitHistory(true);
+    const h = gitHistory;
+    if (!h || h.error || !h.outgoing_known) throw new Error(h?.error || 'Обновите список коммитов с origin перед отправкой.');
+    if (h.behind) throw new Error('На origin есть новые коммиты. Сначала обновите чистый проект через pull или согласуйте историю вручную.');
+    if (!h.ahead) { toast('Неотправленных коммитов нет'); return; }
+    if (!await confirmAction('Отправить неотправленные коммиты?', `Ветка: ${h.branch}\n${h.remote}\nБудут отправлены все ${h.ahead} неотправленных коммитов этой ветки без force push.`, h.outgoing.map(c => `${c.short_hash} · ${c.subject} · ${c.author}`).join('\n') + (h.ahead > h.outgoing.length ? '\nПоказаны первые 50 коммитов.' : ''))) return;
+    const result = await api(`/projects/${id}/git/push`, {method:'POST',body:{confirm:true,expected_head:h.head,expected_branch:h.branch,expected_remote:h.remote}});
+    toast(result.message); await loadGit(); return;
+  }
+  if (action === 'pull') {
     if (!await confirmAction(action === 'pull' ? 'Обновить файлы сервера из Git?' : 'Отправить коммиты?', action === 'pull' ? `В ${p.ssh_path} будет выполнен pull --ff-only из origin/${gitData.branch}. Операция остановится при локальных изменениях или расхождении истории.` : `Коммиты текущей ветки ${gitData.branch} будут отправлены в origin без force push.`)) return;
     const result = await api(`/projects/${id}/git/${action}`, {method:'POST', body:{confirm:true}}); toast(result.message); await loadGit(); return;
   }
   if (action === 'commit') {
-    const files = $$('.git-file:checked').map(box => box.value), message = $('#commit-message').value.trim(), push = $('#commit-push').checked;
+    const files = [...new Set($$('.git-file:checked:not(:disabled)', $('#detail-content')).map(box => box.value))], message = $('#commit-message').value.trim(), push = false;
     if (!files.length || !message) throw new Error('Выберите файлы и укажите сообщение коммита');
     const data = {snapshot:gitData.snapshot, files, message, push};
     if (!gitData.connected) { data.remote = $('#git-remote').value.trim(); data.branch = $('#git-branch').value.trim(); if (!data.remote || !data.branch) throw new Error('Укажите URL репозитория и ветку'); }
     if (!await confirmAction(gitData.connected ? 'Принять изменения сервера в Git?' : 'Создать репозиторий на сервере?', `${files.length} файлов будут добавлены в коммит «${message}».\n${push ? 'Коммит будет отправлен в выбранную ветку origin.' : 'Коммит останется только на сервере.'}\nПроверьте, что в файлах нет паролей и других секретов.`, files.join('\n'))) return;
     const result = await api(`/projects/${id}/git/${gitData.connected ? 'sync' : 'init'}`, {method:'POST', body:data});
     toast(result.warning || `Коммит ${result.commit} ${result.pushed ? 'отправлен в origin' : 'создан на сервере'}`, Boolean(result.warning));
-    await loadGit();
+    await loadGit(); $('#git-history-panel')?.scrollIntoView({behavior:'smooth',block:'start'});
   }
+}
+
+async function loadGitHistory(refresh = false) {
+  const id = selectedId, sequence = ++gitHistoryRequest;
+  const current = () => sequence === gitHistoryRequest && selectedId === id && activeTab === 'git' && $('#detail-dialog').open && $('#git-history-panel');
+  try {
+    const local = await api(`/projects/${id}/git/commits`);
+    if (!current()) return;
+    gitHistory = local; renderGitHistory();
+    if (refresh && local.remote && local.branch !== '(detached HEAD)') {
+      $('#git-history-status').textContent = 'Обновляем историю с origin. Файлы проекта не изменяются…';
+      const data = await api(`/projects/${id}/git/fetch`, {method:'POST'});
+      if (!current()) return;
+      gitHistory = data; renderGitHistory();
+    }
+  } catch (error) {
+    if (!current()) return;
+    gitHistory = {...(gitHistory || {commits:[],outgoing:[]}), error:error.message}; renderGitHistory();
+  }
+}
+function renderGitHistory() {
+  const h = gitHistory, panel = $('#git-history-panel'); if (!panel || !h) return;
+  const entries = list => list.map(c => `<article class="commit-row"><code>${escape(c.short_hash)}</code><div><strong>${escape(c.subject)}</strong><p>${escape(c.author)} &lt;${escape(c.email)}&gt; · ${fullDate(c.date)}</p></div></article>`).join('');
+  panel.innerHTML = `<div class="section-heading"><h3>Коммиты на отправку${h.outgoing_known ? ' · ' + h.ahead : ''}</h3><button class="button secondary small" data-git-action="fetch-commits">Обновить с origin</button></div><p id="git-history-status" class="hint">${escape(h.message || '')}</p>${h.author ? `<p class="hint">Автор следующего коммита: <strong>${escape(h.author.name)} &lt;${escape(h.author.email)}&gt;</strong> · ${escape(h.author.source)}</p>` : ''}${h.error ? `<p class="git-info git-warning">${escape(h.error)}</p>` : ''}${h.behind ? `<p class="git-info git-warning">На origin ${h.behind} коммитов, которых нет на сервере. При расхождении истории отправка остановится; рабочие файлы сохраняются.</p>` : ''}${h.outgoing_known ? h.outgoing.length ? `<div id="outgoing-commits" class="commit-list">${entries(h.outgoing)}</div><p class="hint">Отправятся все неотправленные коммиты текущей ветки. ${h.ahead > h.outgoing.length ? 'Показаны последние 50.' : ''}</p><button class="button primary" data-git-action="push" ${h.error || h.behind ? 'disabled' : ''}>Отправить коммиты (${h.ahead})</button>` : '<p class="hint">Неотправленных коммитов нет.</p>' : '<p class="hint">История на сервере доступна ниже. Для точного списка на отправку обновите origin.</p>'}<details class="commit-history" ${h.outgoing_known ? '' : 'open'}><summary>История текущей ветки · последние ${h.commits.length}</summary><div id="local-commits" class="commit-list">${entries(h.commits) || '<p class="hint">Коммитов пока нет.</p>'}</div></details>`;
 }
 
 function eventsHTML(events) {
@@ -544,7 +582,7 @@ function gitProfileInfo(profile) {
 }
 function openGitProfile(id = '') {
   const form = $('#git-profile-form'), profile = gitProfiles.find(p => p.id === id); form.reset();
-  if (profile) ['id','name','provider','base_url'].forEach(k => form.elements[k].value = profile[k]);
+  if (profile) ['id','name','provider','base_url','git_name','git_email'].forEach(k => form.elements[k].value = profile[k] || '');
   $('#git-profile-error').textContent = ''; gitTokenHelp(); gitProfileInfo(profile); $('#git-profile-dialog').showModal();
 }
 $('#new-git-profile').onclick = () => openGitProfile();

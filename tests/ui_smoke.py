@@ -75,7 +75,7 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            expect(page.locator('#app-version')).to_have_text('v1.5.0')
+            expect(page.locator('#app-version')).to_have_text('v1.6.0')
             assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == 'light'
             assert page.evaluate("parseFloat(getComputedStyle(document.body).fontSize)") >= 16
             page.locator('[data-nav=ssh-profiles]').click()
@@ -107,6 +107,8 @@ def main():
             git_form.locator('[name=provider]').select_option('gitlab')
             git_form.locator('[name=base_url]').fill(git_host['base'])
             git_form.locator('[name=token]').fill(TOKEN)
+            git_form.locator('[name=git_name]').fill('Browser Author')
+            git_form.locator('[name=git_email]').fill('browser@example.com')
             git_form.locator('button[type=submit]').click()
             expect(page.locator('#git-profile-test')).to_be_enabled()
             page.locator('#git-profile-test').click()
@@ -196,8 +198,17 @@ def main():
             except AssertionError:
                 print('Git import diagnostic:', page.locator('#detail-content').inner_text(), page.locator('#toast').inner_text())
                 raise
+            expect(page.locator('#outgoing-commits .commit-row')).to_have_count(1, timeout=20000)
+            expect(page.locator('#outgoing-commits')).to_contain_text('Browser Author')
+            assert subprocess.run(['git','-C',str(bare),'rev-parse','--verify','main'],capture_output=True).returncode != 0
+            assert_toast_above_dialog(page, '#detail-dialog', 'создан на сервере')
+            page.screenshot(path=str(screenshot/'git-outgoing.png'), animations='disabled')
+            page.locator('#git-history-panel [data-git-action=push]').click()
+            expect(page.locator('#confirm-dialog')).to_be_visible()
+            expect(page.locator('#confirm-extra')).to_contain_text('Browser Author')
+            page.locator('#confirm-accept').click()
+            expect(page.locator('#outgoing-commits')).to_have_count(0, timeout=20000)
             assert subprocess.check_output(['git','-C',str(bare),'show','main:index.php']).decode() == '<?php echo "Initial";'
-            assert_toast_above_dialog(page, '#detail-dialog', 'отправлен в origin')
             page.screenshot(path=str(screenshot/'git-notification.png'), animations='disabled')
             (server_files/'index.php').write_text('<?php echo "Updated on server";')
             page.locator('[data-git-action=refresh]').click()
@@ -207,6 +218,10 @@ def main():
             expect(page.locator('#file-diff')).to_contain_text('Updated on server')
             page.locator('[data-git-action=commit]').click(); page.locator('#confirm-accept').click()
             expect(page.get_by_text('Рабочая директория чистая. Изменений для коммита нет.')).to_be_visible(timeout=20000)
+            expect(page.locator('#outgoing-commits .commit-row')).to_have_count(1, timeout=20000)
+            assert subprocess.check_output(['git','-C',str(bare),'show','main:index.php']).decode() == '<?php echo "Initial";'
+            page.locator('#git-history-panel [data-git-action=push]').click(); page.locator('#confirm-accept').click()
+            expect(page.locator('#outgoing-commits')).to_have_count(0, timeout=20000)
             assert 'Updated on server' in subprocess.check_output(['git','-C',str(bare),'show','main:index.php']).decode()
             page.locator('[data-tab=events]').click()
             expect(page.locator('#detail-content .event-row')).not_to_have_count(0)
@@ -251,7 +266,7 @@ def main():
                 assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), f'Horizontal overflow at {width}px'
             assert errors == [], errors
             browser.close()
-            print('UI smoke passed: light theme, larger fonts, clickable notifications above nested modals, project scrolling, SSH/Git profiles, provider authorization, repository picker/attach/access check, HTTPS Git push, SFTP, CRUD, diff/commit, journal, filters, PIN, XSS, responsive layout. Screenshots: test-results/dashboard.png, ssh-browser.png, git-profiles.png, git-notification.png')
+            print('UI smoke passed: light theme, larger fonts, clickable notifications above nested modals, project scrolling, SSH/Git profiles, provider authorization, repository picker/attach/access check, profile author, local commits/outgoing history/separate HTTPS Git push, SFTP, CRUD, diff/commit, journal, filters, PIN, XSS, responsive layout. Screenshots: test-results/dashboard.png, ssh-browser.png, git-profiles.png, git-notification.png, git-outgoing.png')
 
 
 if __name__ == '__main__': main()

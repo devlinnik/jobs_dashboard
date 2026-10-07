@@ -35,3 +35,13 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
 .detail-dialog>.dialog-header,.detail-dialog>.detail-tabs{flex-shrink:0}
 .detail-dialog>.detail-content{flex:1;min-height:0;max-height:none}
 @media(max-width:760px){.brand>div:not(.brand-mark){display:none}}
+.git-history-panel{border-top:1px solid var(--line);margin-top:24px;padding-top:24px}
+.commit-list{border:1px solid var(--line);border-radius:10px;max-height:360px;overflow:auto;margin:16px 0}
+.commit-row{display:flex;align-items:flex-start;gap:14px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.commit-row:last-child{border-bottom:0}
+.commit-row code{font-size:13px;color:var(--mint);background:var(--mint-dark);border-radius:5px;padding:3px 6px;flex-shrink:0}
+.commit-row div{min-width:0;overflow-wrap:anywhere}
+.commit-row strong{font-size:15px;font-weight:550}
+.commit-row p{font-size:13px;color:var(--muted);margin-top:5px}
+.commit-history{margin-top:22px}.commit-history summary{font-size:14px;cursor:pointer;color:var(--muted)}
+@media(max-width:760px){.commit-row{flex-direction:column;gap:7px}}

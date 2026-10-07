@@ -56,7 +56,7 @@ def network(conn, arguments, remote):
     match = re.search(r'(\d+)\.(\d+)', version)
     if not match or tuple(map(int, match.groups())) < (2, 31):
         raise RemoteError('Git-профили требуют Git 2.31+ на сервере. Обновите Git или используйте серверный SSH-ключ без Git-профиля.')
-    if arguments.split()[:2] in (['ls-remote', 'origin'], ['push', 'origin']) or arguments.startswith('pull --ff-only origin '):
+    if 'origin' in shlex.split(arguments):
         for option in ('--all', '--push --all'):
             urls = conn.text('git remote get-url ' + option + ' origin').strip().splitlines()
             if urls != [remote]:
@@ -141,20 +141,28 @@ def snapshot(conn, raw, files, head=''):
 
 
 def candidates(conn):
-    prune = ' -o '.join('-name ' + shlex.quote(p) for p in sorted(EXCLUDED_DIRS))
-    raw = conn.text('find . \\( -type d \\( ' + prune + ' \\) -prune \\) -o \\( -type f -print0 \\)')
-    paths = sorted(p[2:] for p in raw.split('\x00') if p)
+    # Preview through a disposable Git directory outside the project. This applies
+    # existing .gitignore/global excludes before initialization, without creating .git.
+    excludes = ' '.join('--exclude=' + shlex.quote(p + '/') for p in sorted(EXCLUDED_DIRS))
+    raw = conn.text('devlin_git_preview=$(mktemp -d "${TMPDIR:-/tmp}/devlin-git-preview.XXXXXX") || exit; '
+        'trap \'rm -rf -- "$devlin_git_preview"\' EXIT; '
+        'git init --bare -q "$devlin_git_preview" && '
+        'git --git-dir="$devlin_git_preview" --work-tree=. ls-files --others --exclude-standard -z ' + excludes)
+    paths = sorted(p for p in raw.split('\x00') if p)
     if len(paths) > 2000:
         raise RemoteError('Первичная загрузка ограничена 2000 файлами. Исключите зависимости и архивы перед подключением.')
     return [{'path': p, 'status': '??', 'allowed': safe_file(p)} for p in paths]
 
 
-def status(conn):
+def status(conn, include_snapshot=True):
     code, _, _ = conn.run('git rev-parse --is-inside-work-tree')
     if code:
-        files = candidates(conn)
+        metadata, _, _ = conn.run('test -e .git || test -L .git')
+        if metadata == 0:
+            raise RemoteError('В папке уже есть .git, но Git не смог открыть репозиторий. Проверьте права, владельца, safe.directory и состояние .git. Существующая история не изменена.')
+        files = candidates(conn) if include_snapshot else []
         raw = json.dumps(files, sort_keys=True)
-        return {'connected': False, 'files': files, 'snapshot': snapshot(conn, raw, files), 'branch': '', 'head': '', 'remote': ''}
+        return {'connected': False, 'files': files, 'snapshot': snapshot(conn, raw, files) if include_snapshot else '', 'branch': '', 'head': '', 'remote': ''}
     root = conn.text('git rev-parse --show-toplevel').strip()
     real = conn.text('pwd -P').strip()
     if root != real:
@@ -185,7 +193,7 @@ def status(conn):
             validate_remote(remote)
         except RemoteError:
             remote = '(адрес скрыт: небезопасный URL; настройте SSH remote на сервере)'
-    return {'connected': True, 'files': files, 'snapshot': snapshot(conn, raw, files, head),
+    return {'connected': True, 'files': files, 'snapshot': snapshot(conn, raw, files, head) if include_snapshot else '',
             'branch': branch, 'head': head[:12], 'remote': remote,
             'staged': any(f['status'][0] not in (' ', '?') for f in files)}
 
@@ -208,15 +216,106 @@ def diff(conn, path):
             return 'Двоичный файл: текстовый просмотр недоступен.'
         return content.decode('utf-8', errors='replace')
     base = 'HEAD' if current['head'] else '--cached'
-    return conn.text('git diff --no-ext-diff ' + base + ' -- ' + shlex.quote(path), max_output=200_000) or 'Нет текстового diff (например, изменение прав файла).'
+    return conn.text('git --literal-pathspecs diff --no-ext-diff ' + base + ' -- ' + shlex.quote(path), max_output=200_000) or 'Нет текстового diff (например, изменение прав файла).'
 
 
-def commit(conn, current, files, message, settings, push=True):
+def author_identity(conn, settings):
+    profile = getattr(conn, 'git_profile', {}) or {}
+    if profile.get('git_name') and profile.get('git_email'):
+        return {'name': profile['git_name'], 'email': profile['git_email'], 'source': 'Git-профиль'}
+    values = []
+    for key in ('user.name', 'user.email'):
+        code, out, _ = conn.run('git config --get ' + key)
+        values.append(out.decode('utf-8', errors='replace').strip() if code == 0 else '')
+    if all(values) and not any(c in ''.join(values) for c in '\x00\r\n'):
+        return {'name': values[0], 'email': values[1], 'source': 'Настройки Git на сервере'}
+    return {'name': settings['git_name'], 'email': settings['git_email'], 'source': 'Настройки приложения'}
+
+
+def log_commits(conn, revision):
+    raw = conn.text('git log -z -n 50 --format=%H%x00%h%x00%an%x00%ae%x00%aI%x00%s ' +
+                    shlex.quote(revision) + ' --', max_output=400_000)
+    fields = raw.rstrip('\x00').split('\x00') if raw else []
+    if len(fields) % 6:
+        raise RemoteError('Не удалось разобрать историю коммитов')
+    return [dict(zip(('hash','short_hash','author','email','date','subject'), fields[i:i+6]))
+            for i in range(0, len(fields), 6)]
+
+
+def history(conn, settings, remote_tip=None):
+    current = status(conn, include_snapshot=False)
+    result = {'commits': [], 'outgoing': [], 'ahead': None, 'behind': None, 'outgoing_known': False,
+              'head': '', 'branch': current['branch'], 'remote': current['remote'],
+              'author': author_identity(conn, settings), 'checked': remote_tip is not None,
+              'message': 'Локальный Git ещё не создан.'}
+    if not current['connected']:
+        return result
+    if current['head']:
+        result['head'] = conn.text('git rev-parse HEAD').strip()
+        result['commits'] = log_commits(conn, 'HEAD')
+    if current['branch'] == '(detached HEAD)':
+        result['message'] = 'HEAD не привязан к ветке. Историю можно смотреть; для отправки выберите ветку на сервере.'
+        return result
+    validate_branch(current['branch'])
+    if not current['remote']:
+        result['message'] = 'origin не настроен. Коммиты остаются на сервере до подключения репозитория.'
+        return result
+    if remote_tip is None:
+        code, out, _ = conn.run('git rev-parse --verify refs/remotes/origin/' + shlex.quote(current['branch']))
+        if code:
+            result['message'] = 'Нужно обновить данные с origin, чтобы определить неотправленные коммиты.'
+            return result
+        remote_tip = out.decode().strip()
+    if not result['head']:
+        result.update(ahead=0, behind=0, outgoing_known=True, message='Коммитов на сервере пока нет. Существующие файлы можно добавить первым коммитом.')
+        return result
+    if remote_tip:
+        if not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', remote_tip):
+            raise RemoteError('Некорректная ссылка удалённой ветки')
+        counts = conn.text('git rev-list --left-right --count HEAD...' + remote_tip).split()
+        ahead, behind = map(int, counts)
+        result['outgoing'] = log_commits(conn, remote_tip + '..HEAD') if ahead else []
+    else:
+        ahead, behind = int(conn.text('git rev-list --count HEAD').strip()), 0
+        result['outgoing'] = result['commits']
+    result.update(ahead=ahead, behind=behind, outgoing_known=True,
+                  message='По локальной копии origin; обновите перед отправкой.' if not result['checked'] else
+                  'Удалённая ветка ещё не создана. При push будет отправлена история текущей ветки.' if not remote_tip else
+                  'Состояние origin обновлено. Файлы проекта не изменены.')
+    return result
+
+
+def fetch_commits(conn, settings):
+    current = status(conn, include_snapshot=False)
+    if not current['connected'] or not current['remote'] or current['branch'] == '(detached HEAD)':
+        return history(conn, settings)
+    branch = validate_branch(current['branch'])
+    remote = conn.text('git config --get remote.origin.url').strip()
+    code, out, _ = network(conn, 'ls-remote --heads origin ' + shlex.quote('refs/heads/' + branch), remote)
+    if code:
+        raise RemoteError('Не удалось получить список коммитов с origin. Локальные коммиты сохранены; проверьте Git-профиль, права и сеть.')
+    if not out.strip():
+        conn.text('git update-ref -d ' + shlex.quote('refs/remotes/origin/' + branch))
+        return history(conn, settings, remote_tip='')
+    code, _, _ = network(conn, 'fetch --no-tags origin ' + shlex.quote(branch), remote)
+    if code:
+        raise RemoteError('Не удалось обновить историю origin. Рабочие файлы не изменены; проверьте Git-доступ.')
+    tip = conn.text('git rev-parse --verify FETCH_HEAD').strip()
+    if not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', tip):
+        raise RemoteError('Git вернул некорректную ссылку origin')
+    conn.text('git update-ref ' + shlex.quote('refs/remotes/origin/' + branch) + ' ' + tip)
+    latest = status(conn, include_snapshot=False)
+    if latest['branch'] != branch or latest['remote'] != current['remote']:
+        raise RemoteError('Ветка или origin изменились во время обновления истории. Обновите вкладку Git заново.')
+    return history(conn, settings, remote_tip=tip)
+
+
+def commit(conn, current, files, message, settings, push=False):
     if current.get('staged'):
         raise RemoteError('На сервере уже есть staged-изменения. Завершите или отмените их на сервере перед синхронизацией.')
     allowed = {f['path'] for f in current['files'] if f['allowed']}
     if len(set(files)) != len(files) or any(p not in allowed for p in files):
-        raise RemoteError('Набор файлов изменился или содержит запрещённые пути')
+        raise RemoteError('Выбранные файлы больше не входят в допустимые изменения. Обновите список: .gitignore, исключённые пути или изменения на сервере могли изменить набор. Файлы не добавлены в индекс.')
     if current.get('branch') == '(detached HEAD)':
         raise RemoteError('HEAD не привязан к ветке. Выберите ветку на сервере.')
     configured_branch = getattr(conn, 'project', {}).get('git_branch', '')
@@ -225,16 +324,20 @@ def commit(conn, current, files, message, settings, push=True):
     if '\x00' in message:
         raise RemoteError('Некорректное сообщение коммита')
     paths = list(files)
+    identity = author_identity(conn, settings)
     for item in current['files']:
         if item['path'] in files and item.get('old_path'):
             paths.append(item['old_path'])
     for start in range(0, len(paths), 100):
-        conn.text('git add -A -- ' + ' '.join(shlex.quote(p) for p in paths[start:start + 100]))
+        conn.text('git --literal-pathspecs add -A -- ' + ' '.join(shlex.quote(p) for p in paths[start:start + 100]))
     # If a hook fails, do not undo the server index or overwrite the user's work.
-    conn.text('git -c user.name=' + shlex.quote(settings['git_name']) + ' -c user.email=' + shlex.quote(settings['git_email']) +
+    environment = ' '.join(key + '=' + shlex.quote(value) for key,value in (
+        ('GIT_AUTHOR_NAME',identity['name']), ('GIT_AUTHOR_EMAIL',identity['email']),
+        ('GIT_COMMITTER_NAME',identity['name']), ('GIT_COMMITTER_EMAIL',identity['email'])))
+    conn.text(environment + ' git -c user.name=' + shlex.quote(identity['name']) + ' -c user.email=' + shlex.quote(identity['email']) +
               ' commit -m ' + shlex.quote(message), timeout=90)
     head = conn.text('git rev-parse --short HEAD').strip()
-    result = {'commit': head, 'pushed': False, 'warning': ''}
+    result = {'commit': head, 'pushed': False, 'warning': '', 'author': identity}
     if push:
         remote = conn.text('git config --get remote.origin.url').strip()
         validate_remote(remote)
@@ -307,13 +410,34 @@ def pull(conn):
     return {'message': 'Ветка обновлена без перезаписи локальных изменений'}
 
 
-def push(conn):
-    current = status(conn)
+def push(conn, request=None, settings=None):
+    current = status(conn, include_snapshot=False)
     enforce_branch(conn, current)
     if not current['connected'] or current['branch'] == '(detached HEAD)':
         raise RemoteError('Нужен репозиторий с выбранной веткой')
     remote = conn.text('git config --get remote.origin.url').strip()
-    code, _, _ = network(conn, 'push origin HEAD', remote)
+    if not current['head']:
+        raise RemoteError('Сначала создайте коммит на сервере')
+    def verify_request():
+        if not request:
+            return
+        actual = status(conn, include_snapshot=False)
+        head = conn.text('git rev-parse HEAD').strip()
+        if ((request.expected_head and request.expected_head != head) or
+                (request.expected_branch and request.expected_branch != actual['branch']) or
+                (request.expected_remote and request.expected_remote != actual['remote'])):
+            raise RemoteError('Коммиты, ветка или origin изменились после просмотра. Обновите список и подтвердите отправку заново.')
+    verify_request()
+    outgoing = fetch_commits(conn, settings or {'git_name':'Devlin Desk', 'git_email':'desk@localhost'})
+    verify_request()
+    if outgoing['behind']:
+        raise RemoteError('На origin есть новые коммиты, которых нет на сервере. Сначала обновите чистый проект через pull или согласуйте историю вручную. Force push не выполняется.')
+    if outgoing['ahead'] == 0:
+        return {'message': 'Неотправленных коммитов нет: текущая ветка уже актуальна.'}
+    # Pin the reviewed commit and destination: a concurrent server commit must not
+    # silently enter this push after the final HEAD check.
+    revision = outgoing['head'] + ':refs/heads/' + outgoing['branch']
+    code, _, _ = network(conn, 'push origin ' + shlex.quote(revision), remote)
     if code:
         raise RemoteError('Push не выполнен. Проверьте Git-доступ, права выбранной ветки и расхождение истории.')
     return {'message': 'Коммиты отправлены в текущую ветку origin'}

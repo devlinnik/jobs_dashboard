@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, field_validator
 from .store import Store, now
 from .security import Sessions, hash_pin, verify_pin
-from .models import ProjectInput, SettingsInput, SyncInput, InitInput, SSHProfileInput, GitProfileInput, GitAttachInput, web_url
+from .models import ProjectInput, SettingsInput, SyncInput, InitInput, SSHProfileInput, GitProfileInput, GitAttachInput, GitPushInput, web_url
 from .remote import connect, inspect_host, RemoteError
 from .monitor import Monitor, probe_script
 from . import gitops
@@ -395,6 +395,9 @@ def create_app(directory=None, start_monitor=True):
         async with git_profiles_lock:
             old = store.git_profile(profile_id)
             data = old | body.model_dump(exclude={'token', 'clear_token'})
+            for key in ('git_name', 'git_email'):
+                if key not in body.model_fields_set:
+                    data[key] = old.get(key, '')
             changed_service = (old['provider'], old['base_url']) != (data['provider'], data['base_url'])
             if body.clear_token or changed_service:
                 data['token_enc'] = ''  # A token is never reused for another service.
@@ -441,6 +444,26 @@ def create_app(directory=None, start_monitor=True):
     @app.get('/api/projects/{pid}/git/diff', dependencies=auth)
     async def git_diff(pid: str, path: str):
         return {'diff': await operation(pid, gitops.diff, path)}
+
+    @app.get('/api/projects/{pid}/git/commits', dependencies=auth)
+    async def git_commits(pid: str):
+        return await operation(pid, gitops.history, store.settings())
+
+    @app.post('/api/projects/{pid}/git/fetch', dependencies=auth)
+    async def fetch_git_commits(pid: str):
+        return await operation(pid, gitops.fetch_commits, store.settings())
+
+    @app.post('/api/projects/{pid}/git/push', dependencies=auth)
+    async def push_git_commits(pid: str, body: GitPushInput):
+        if not body.confirm:
+            raise HTTPException(400, 'Нужно подтвердить отправку коммитов')
+        result = await operation(pid, gitops.push, body, store.settings())
+        store.event(pid, 'success', result['message'])
+        previous = store.state(pid)
+        previous.pop('pending_push', None)
+        store.save_state(pid, previous)
+        monitor.due[pid] = 0
+        return result
 
     @app.post('/api/projects/{pid}/git/sync', dependencies=auth)
     async def git_sync(pid: str, body: SyncInput):

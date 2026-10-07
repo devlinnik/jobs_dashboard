@@ -26,7 +26,8 @@ def test_profile_crud_encryption_account_and_project_references(tmp_path, monkey
     with TestClient(create_app(tmp_path, start_monitor=False), headers={'X-App-Request': '1'}) as client:
         assert client.get('/api/git-profiles').status_code == 401
         client.post('/api/unlock', json={})
-        profile = client.post('/api/git-profiles', json={'name': 'GitHub', 'token': 'test-token'}).json()
+        profile = client.post('/api/git-profiles', json={'name': 'GitHub', 'token': 'test-token',
+            'git_name':'Profile Author', 'git_email':'profile@example.com'}).json()
         prefix = '/api/git-profiles/'+profile['id']
         assert profile['has_token'] and 'test-token' not in json.dumps(profile) and 'token_enc' not in profile
         stored = client.app.state.store.git_profile(profile['id'])
@@ -43,6 +44,7 @@ def test_profile_crud_encryption_account_and_project_references(tmp_path, monkey
         assert all(p['git_profile_name'] == 'GitHub' for p in client.get('/api/projects').json())
         edited = client.put(prefix, json={'name':'Renamed'}).json()
         assert edited['has_token'] and edited['account'] == 'developer'
+        assert edited['git_name'] == 'Profile Author' and edited['git_email'] == 'profile@example.com'
         edited = client.put(prefix, json={'name':'Lab', 'provider':'gitlab', 'base_url':'https://gitlab.com'}).json()
         assert not edited['has_token'] and not edited['account']  # Never transfer token to another host.
         monkeypatch.setattr(Provider, 'request', original_request)
@@ -56,7 +58,8 @@ def test_profile_crud_encryption_account_and_project_references(tmp_path, monkey
 @pytest.mark.parametrize('values', [
     {'provider':'other'}, {'base_url':'https://other.test'}, {'provider':'gitlab','base_url':'http://gitlab.com'},
     {'provider':'gitlab','base_url':'https://user:pass@gitlab.com'}, {'token':'bad\ntoken'},
-    {'provider':'gitlab','base_url':'https://gitlab.com/path'}])
+    {'provider':'gitlab','base_url':'https://gitlab.com/path'}, {'git_name':'Only a name'},
+    {'git_name':'Author','git_email':'invalid'}, {'git_name':'bad\nname','git_email':'a@example.com'}])
 def test_invalid_git_profile_input(tmp_path, values):
     with TestClient(create_app(tmp_path, start_monitor=False), headers={'X-App-Request':'1'}) as client:
         client.post('/api/unlock', json={})
@@ -121,7 +124,8 @@ def test_real_profile_attach_commit_push_pull_and_read_access(tmp_path, monkeypa
         monkeypatch.setenv('NO_PROXY', '127.0.0.1,localhost')
         with ssh_server({'GIT_SSL_CAINFO':str(host['ca']), 'NO_PROXY':'127.0.0.1,localhost'}) as (port, key), TestClient(create_app(tmp_path/'data', start_monitor=False), headers={'X-App-Request':'1'}) as client:
             client.post('/api/unlock', json={})
-            profile = client.post('/api/git-profiles', json={'name':'Lab','provider':'gitlab','base_url':host['base'],'token':TOKEN}).json()
+            profile = client.post('/api/git-profiles', json={'name':'Lab','provider':'gitlab','base_url':host['base'],'token':TOKEN,
+                'git_name':'Profile Author','git_email':'profile@example.com'}).json()
             assert client.post('/api/git-profiles/'+profile['id']+'/test').json()['account']['username'] == 'developer'
             repositories = client.get('/api/git-profiles/'+profile['id']+'/repositories').json()
             assert repositories['repositories'][0]['remote'] == host['remote']
@@ -140,8 +144,17 @@ def test_real_profile_attach_commit_push_pull_and_read_access(tmp_path, monkeypa
             assert (project_dir/'index.php').read_text() == 'initial'
             assert client.post(prefix+'/git/check').json()['ok']
             state = client.get(prefix+'/git').json()
-            committed = client.post(prefix+'/git/sync', json={'snapshot':state['snapshot'],'files':['index.php'],'message':'Import','push':True})
-            assert committed.status_code == 200 and committed.json()['pushed'], committed.text
+            committed = client.post(prefix+'/git/sync', json={'snapshot':state['snapshot'],'files':['index.php'],'message':'Import'})
+            assert committed.status_code == 200 and not committed.json()['pushed'], committed.text
+            assert committed.json()['author']['source'] == 'Git-профиль'
+            assert client.get(prefix+'/git/commits').json()['commits'][0]['author'] == 'Profile Author'
+            pending = client.post(prefix+'/git/fetch').json()
+            assert pending['ahead'] == 1 and pending['outgoing'][0]['subject'] == 'Import'
+            assert client.post(prefix+'/git/push', json={'confirm':False}).status_code == 400
+            pushed = client.post(prefix+'/git/push', json={'confirm':True,'expected_head':pending['head'],
+                'expected_branch':pending['branch'],'expected_remote':pending['remote']})
+            assert pushed.status_code == 200, pushed.text
+            assert client.post(prefix+'/git/fetch').json()['ahead'] == 0
             assert subprocess.check_output(['git','-C',str(host['bare']),'show','main:index.php']).decode() == 'initial'
             # A new remote commit is pulled through the same profile without storing credentials.
             clone = tmp_path/'author'

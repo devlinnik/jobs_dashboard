@@ -112,6 +112,16 @@ class GitProfileInput(BaseModel):
     base_url: str = Field(default='https://github.com', max_length=2048)
     token: str | None = Field(default=None, max_length=2048)
     clear_token: bool = False
+    git_name: str = Field(default='', max_length=100)
+    git_email: str = Field(default='', max_length=200)
+
+    @field_validator('git_name', 'git_email')
+    @classmethod
+    def clean_author(cls, value):
+        value = value.strip()
+        if any(c in value for c in '\x00\r\n'):
+            raise ValueError('Некорректная подпись автора')
+        return value
 
     @model_validator(mode='after')
     def validate_profile(self):
@@ -130,6 +140,10 @@ class GitProfileInput(BaseModel):
             raise ValueError('Для GitHub используйте https://github.com')
         if self.token is not None and (not self.token or any(c.isspace() or ord(c) < 32 for c in self.token)):
             raise ValueError('Токен не должен содержать пробелы или управляющие символы')
+        if bool(self.git_name) != bool(self.git_email):
+            raise ValueError('Заполните имя и email автора вместе либо оставьте оба пустыми')
+        if self.git_email and not re.fullmatch(r'[^@\s]+@[^@\s]+', self.git_email):
+            raise ValueError('Некорректный email автора')
         return self
 
 
@@ -177,7 +191,7 @@ class SyncInput(BaseModel):
     snapshot: str
     files: list[str] = Field(min_length=1, max_length=2000)
     message: str = Field(min_length=1, max_length=500)
-    push: bool = True
+    push: bool = False
 
 
 class InitInput(SyncInput):
@@ -193,3 +207,10 @@ class GitAttachInput(BaseModel):
     expected_git_profile_id: str = Field(default='', max_length=100)
     replace_remote: bool = False
     confirm: bool = False
+
+
+class GitPushInput(BaseModel):
+    confirm: bool = False
+    expected_head: str = Field(default='', max_length=64)
+    expected_branch: str = Field(default='', max_length=100)
+    expected_remote: str = Field(default='', max_length=2048)

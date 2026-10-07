@@ -130,6 +130,126 @@ def test_initialize_and_push_to_real_bare_repository(tmp_path):
 
 
 @POSIX_ONLY
+def test_initial_import_respects_existing_gitignore_and_preserves_files(tmp_path):
+    work = tmp_path/'project'; work.mkdir()
+    (work/'.gitignore').write_text('cache/\n*.log\n')
+    (work/'cache').mkdir(); (work/'cache/result.txt').write_text('keep on server')
+    (work/'server.log').write_text('keep log')
+    (work/'index.php').write_text('site')
+    config = tmp_path/'git.config'; config.write_text('')
+    conn = LocalConnection(work, {'GIT_CONFIG_GLOBAL':str(config), 'GIT_CONFIG_NOSYSTEM':'1'})
+    initial = gitops.status(conn)
+    assert {f['path'] for f in initial['files']} == {'.gitignore','index.php'}
+    assert not (work/'.git').exists()  # A preview must not initialize the project.
+    result = gitops.initialize(conn, SimpleNamespace(remote='https://github.com/team/project.git',branch='main',
+        snapshot=initial['snapshot'],files=['.gitignore','index.php'],message='Import',push=False),
+        {'git_name':'Fallback Author','git_email':'fallback@example.com'})
+    assert not result['pushed'] and result['author']['source'] == 'Настройки приложения'
+    assert git(work, 'log', '-1', '--format=%an <%ae>') == 'Fallback Author <fallback@example.com>'
+    assert (work/'cache/result.txt').read_text() == 'keep on server'
+    assert (work/'server.log').read_text() == 'keep log'
+    assert gitops.status(conn)['files'] == []
+
+
+@POSIX_ONLY
+def test_author_profile_precedence_preserves_server_configuration(repo):
+    work, conn = repo
+    settings = {'git_name':'App Author','git_email':'app@example.com'}
+    assert gitops.author_identity(conn, settings)['name'] == 'Test'
+    conn.git_profile = {'git_name':'Profile Author', 'git_email':'profile@example.com'}
+    (work/'index.php').write_text('changed')
+    state = gitops.status(conn)
+    result = gitops.sync(conn, SimpleNamespace(snapshot=state['snapshot'],files=['index.php'],message='Commit',push=False), settings)
+    assert result['author']['source'] == 'Git-профиль'
+    assert git(work,'log','-1','--format=%an <%ae>') == 'Profile Author <profile@example.com>'
+    assert git(work,'config','--local','--get','user.name') == 'Test'
+    assert git(work,'config','--local','--get','user.email') == 'test@example.com'
+
+
+@POSIX_ONLY
+def test_invalid_existing_git_metadata_is_not_reinitialized(tmp_path):
+    work = tmp_path/'project'; work.mkdir()
+    (work/'.git').mkdir(); (work/'.git/keep.txt').write_text('existing metadata')
+    with pytest.raises(RemoteError, match='уже есть .git'):
+        gitops.status(LocalConnection(work))
+    assert (work/'.git/keep.txt').read_text() == 'existing metadata'
+
+
+@POSIX_ONLY
+def test_outgoing_commits_are_listed_and_sent_separately(repo, tmp_path, monkeypatch):
+    work, _ = repo
+    bare = tmp_path/'origin.git'; git(tmp_path,'init','--bare','-b','main',str(bare))
+    config = tmp_path/'git.config'
+    remote = 'git@gitlab.test:team/project.git'
+    config.write_text('[url "'+bare.as_uri()+'"]\n\tinsteadOf = '+remote+'\n')
+    conn = LocalConnection(work, {'GIT_CONFIG_GLOBAL':str(config),'GIT_ALLOW_PROTOCOL':'file:ssh'})
+    git(work,'remote','add','origin',remote)
+    settings = {'git_name':'App Author','git_email':'app@example.com'}
+    for value in ('second', 'third'):
+        (work/'index.php').write_text(value)
+        state = gitops.status(conn)
+        result = gitops.sync(conn, SimpleNamespace(snapshot=state['snapshot'],files=['index.php'],message=value,push=False), settings)
+        assert not result['pushed']
+    assert subprocess.run(['git','-C',str(bare),'rev-parse','--verify','main'],capture_output=True).returncode != 0
+    outgoing = gitops.fetch_commits(conn, settings)
+    assert outgoing['ahead'] == 3 and outgoing['behind'] == 0
+    assert [c['subject'] for c in outgoing['outgoing']] == ['third','second','initial']
+    request = SimpleNamespace(expected_head=outgoing['head'],expected_branch='main',expected_remote=remote)
+    assert gitops.push(conn, request, settings)['message']
+    assert git(bare,'show','main:index.php') == 'third'
+    assert gitops.fetch_commits(conn, settings)['ahead'] == 0
+    # A commit created after confirmation must never be silently included in push.
+    (work/'index.php').write_text('after preview')
+    state = gitops.status(conn)
+    gitops.sync(conn, SimpleNamespace(snapshot=state['snapshot'],files=['index.php'],message='new',push=False), settings)
+    with pytest.raises(RemoteError, match='изменились после просмотра'): gitops.push(conn, request, settings)
+    assert git(bare,'show','main:index.php') == 'third'
+    reviewed = gitops.fetch_commits(conn, settings)
+    request.expected_head = reviewed['head']
+    original_network = gitops.network
+    def concurrent_commit(connection, arguments, remote_url):
+        if arguments.startswith('push '):
+            (work/'index.php').write_text('concurrent unreviewed commit')
+            git(work,'add','index.php'); git(work,'commit','-m','Concurrent server commit')
+        return original_network(connection, arguments, remote_url)
+    monkeypatch.setattr(gitops, 'network', concurrent_commit)
+    gitops.push(conn, request, settings)
+    assert git(bare,'rev-parse','main') == reviewed['head']
+    assert git(bare,'show','main:index.php') == 'after preview'
+    assert gitops.fetch_commits(conn, settings)['ahead'] == 1
+
+
+@POSIX_ONLY
+def test_nonempty_origin_history_blocks_push_and_preserves_server_files(repo, tmp_path):
+    work, _ = repo
+    bare = tmp_path/'origin.git'; git(tmp_path,'init','--bare','-b','main',str(bare))
+    remote = 'git@gitlab.test:team/project.git'
+    config = tmp_path/'git.config'
+    config.write_text('[url "'+bare.as_uri()+'"]\n\tinsteadOf = '+remote+'\n')
+    conn = LocalConnection(work, {'GIT_CONFIG_GLOBAL':str(config),'GIT_ALLOW_PROTOCOL':'file:ssh'})
+    git(work,'remote','add','origin',remote)
+    # The remote has independent history; attachment must never replace either tree.
+    other = tmp_path/'other'; other.mkdir()
+    git(other,'init','-b','main')
+    git(other,'config','user.name','Remote Author'); git(other,'config','user.email','remote@example.com')
+    (other/'README.md').write_text('existing remote project')
+    git(other,'add','.'); git(other,'commit','-m','Existing remote history')
+    git(other,'push',str(bare),'main')
+    (work/'index.php').write_text('uncommitted server files')
+    head = git(work,'rev-parse','HEAD')
+    settings = {'git_name':'App Author','git_email':'app@example.com'}
+    state = gitops.fetch_commits(conn, settings)
+    assert state['ahead'] == 1 and state['behind'] == 1
+    assert state['outgoing'][0]['subject'] == 'initial'
+    with pytest.raises(RemoteError, match='origin'):
+        gitops.push(conn, SimpleNamespace(expected_head=head,expected_branch='main',expected_remote=remote), settings)
+    assert git(work,'rev-parse','HEAD') == head
+    assert (work/'index.php').read_text() == 'uncommitted server files'
+    assert not (work/'README.md').exists()
+    assert git(bare,'show','main:README.md') == 'existing remote project'
+
+
+@POSIX_ONLY
 def test_pull_requires_clean_tree_and_parent_repo_is_rejected(repo):
     work,conn = repo
     (work/'index.php').write_text('server edit')
