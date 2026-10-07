@@ -39,10 +39,16 @@ def retry_windows_lock(action, description):
             if getattr(error, 'winerror', None) not in (5, 32, 33):
                 raise
             if attempt == 7:
+                if error.winerror in (32, 33):
+                    guidance = ('A process is holding this file or folder open. Exit Devlin Desk through the tray menu, '
+                                'close other launchers/editors and terminal windows opened inside the application folder '
+                                '(or change their current directory to the repository root), then retry. '
+                                'No processes were terminated automatically.')
+                else:
+                    guidance = ('Check Windows Security Protection history and application-control policies '
+                                'for this exact file, and verify folder permissions. Do not disable protection.')
                 raise InstallError(
-                    f'{description}: Windows denied access after 8 attempts. {error}. '
-                    'Check Windows Security Protection history and application-control policies '
-                    'for this exact file, and verify folder permissions. Do not disable protection.'
+                    f'{description}: Windows denied access after 8 attempts. {error}. ' + guidance
                 ) from error
             print(f'{description}: file temporarily unavailable; retrying in 2 seconds '
                   f'({attempt + 1}/8).', flush=True)
@@ -288,7 +294,7 @@ def verify_launcher(release, work):
         result = json.loads(report.read_text(encoding='utf-8-sig'))
     except (OSError, ValueError) as exc:
         raise InstallError('The launcher did not produce a readiness report.') from exc
-    if result.get('ok') is not True or len(result.get('checks', [])) < 4:
+    if result.get('ok') is not True or len(result.get('checks', [])) < 5:
         raise InstallError('The launcher failed its process/resource check: ' + str(result.get('error', 'no details')))
 
 

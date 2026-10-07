@@ -11,7 +11,7 @@ using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 [assembly: AssemblyTitle("Devlin Desk Launcher")]
-[assembly: AssemblyVersion("1.10.0.0")]
+[assembly: AssemblyVersion("1.10.3.0")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8")]
 namespace DevlinInstaller {
     internal static class Program {
@@ -56,8 +56,20 @@ namespace DevlinInstaller {
         internal static ProcessStartInfo InstallerProcess(IEnumerable<string> arguments, string directory) {
             return new ProcessStartInfo(PowerShell, String.Join(" ", arguments.Select(Quote))) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8, WorkingDirectory = directory };
         }
+        internal static ProcessStartInfo DetachedProcess(string executable, string arguments, string folder) {
+            // Windows keeps a handle to CurrentDirectory, independently of the EXE.
+            // Do not inherit the installed/source directory into the temporary child.
+            return new ProcessStartInfo(executable, arguments) { UseShellExecute = false, WorkingDirectory = folder, CreateNoWindow = true };
+        }
         [STAThread] private static int Main(string[] args) {
             if (args.Length == 2 && args[0] == "--self-test-output") return SelfTest(args[1]);
+            if (args.Length == 3 && args[0] == "--cwd-probe") {
+                File.WriteAllText(args[1] + ".tmp", Environment.CurrentDirectory, Encoding.UTF8);
+                File.Move(args[1] + ".tmp", args[1]);
+                var limit = Stopwatch.StartNew();
+                while (!File.Exists(args[2]) && limit.ElapsedMilliseconds < 10000) System.Threading.Thread.Sleep(50);
+                return File.Exists(args[2]) ? 0 : 1;
+            }
             string temp = null;
             try {
                 if (args.Length == 3 && args[0] == "--handoff") {
@@ -66,7 +78,7 @@ namespace DevlinInstaller {
                     string candidate = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
                     // Only a folder created by this launcher may be extracted to or removed.
                     if (!Path.GetFileName(candidate).StartsWith("DevlinLauncher-", StringComparison.Ordinal) || !String.Equals(Path.GetDirectoryName(candidate), Path.GetTempPath().TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) throw new IOException("Invalid launcher workspace.");
-                    temp = candidate; Extract(temp);
+                    temp = candidate; Environment.CurrentDirectory = temp; Extract(temp);
                     var paths = Locate(args[2]);
                     // Use current checkout scripts after git pull; standalone launchers use embedded copies.
                     foreach (string name in Resources.Where(n => n != "devlin-desk.ico")) {
@@ -81,7 +93,7 @@ namespace DevlinInstaller {
                 temp = Path.Combine(Path.GetTempPath(), "DevlinLauncher-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(temp);
                 string origin = Assembly.GetExecutingAssembly().Location;
                 string child = Path.Combine(temp, "DevlinLauncher.exe"); File.Copy(origin, child);
-                Process.Start(new ProcessStartInfo(child, "--handoff " + Process.GetCurrentProcess().Id + " " + Quote(origin)) { UseShellExecute = false });
+                Process.Start(DetachedProcess(child, "--handoff " + Process.GetCurrentProcess().Id + " " + Quote(origin), temp));
                 temp = null; // the child owns cleanup; original executable is now unlocked
                 return 0;
             } catch (Exception e) { MessageBox.Show(e.Message, "Devlin Desk — ошибка запуска", MessageBoxButtons.OK, MessageBoxIcon.Error); return 1; }
@@ -90,11 +102,12 @@ namespace DevlinInstaller {
         private static void CleanupAfterExit(string folder) {
             // Wait for this exact process; never terminate processes or touch application data.
             string script = "$ErrorActionPreference='Stop'; try { Wait-Process -Id " + Process.GetCurrentProcess().Id + " -ErrorAction SilentlyContinue } finally { Remove-Item -LiteralPath '" + folder.Replace("'", "''") + "' -Recurse -Force -ErrorAction SilentlyContinue }";
-            try { Process.Start(new ProcessStartInfo(PowerShell, "-NoProfile -NonInteractive -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script))) { UseShellExecute = false, CreateNoWindow = true }); } catch { }
+            try { Process.Start(new ProcessStartInfo(PowerShell, "-NoProfile -NonInteractive -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script))) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Path.GetTempPath() }); } catch { }
         }
         private static int SelfTest(string output) {
             string folder = Path.Combine(Path.GetTempPath(), "DevlinLauncher-Test-" + Guid.NewGuid().ToString("N"));
             var checks = new List<string>(); string error = null;
+            string originalDirectory = Environment.CurrentDirectory;
             try {
                 Directory.CreateDirectory(folder); Extract(folder);
                 foreach (string name in Resources) if (new FileInfo(Path.Combine(folder, name)).Length == 0) throw new Exception("Empty resource " + name);
@@ -115,8 +128,22 @@ namespace DevlinInstaller {
                 int exit = Execute(InstallerProcess(new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", fixture, "-Value", value }, folder), delegate(string line) { lock (lines) lines.Add(line); });
                 if (exit != 7 || !lines.Contains(value) || !lines.Contains("stderr fixture")) throw new Exception("Redirected process output, quoting or exit status failed");
                 checks.Add("real PowerShell Unicode stdout/stderr, argument boundaries and exit 7");
+                string installed = Path.Combine(folder, "installed"); Directory.CreateDirectory(installed);
+                string cwdReport = Path.Combine(folder, "cwd.txt"), releaseChild = Path.Combine(folder, "release-child");
+                Environment.CurrentDirectory = installed;
+                using (var child = Process.Start(DetachedProcess(Assembly.GetExecutingAssembly().Location, "--cwd-probe " + Quote(cwdReport) + " " + Quote(releaseChild), folder))) {
+                    Environment.CurrentDirectory = originalDirectory;
+                    try {
+                        var timer = Stopwatch.StartNew();
+                        while (!File.Exists(cwdReport) && !child.HasExited && timer.ElapsedMilliseconds < 5000) System.Threading.Thread.Sleep(50);
+                        if (!File.Exists(cwdReport) || !String.Equals(File.ReadAllText(cwdReport, Encoding.UTF8), folder, StringComparison.OrdinalIgnoreCase)) throw new Exception("Detached child inherited the installation folder");
+                        Directory.Move(installed, installed + "-backup"); // child is still running
+                    } finally { File.WriteAllText(releaseChild, "done"); if (!child.WaitForExit(10000)) throw new Exception("Detached probe did not exit"); }
+                    if (child.ExitCode != 0) throw new Exception("Detached probe failed");
+                }
+                checks.Add("installed directory can be renamed while detached child is running");
             } catch (Exception e) { error = e.ToString(); }
-            finally { if (Directory.Exists(folder)) Directory.Delete(folder, true); }
+            finally { Environment.CurrentDirectory = originalDirectory; if (Directory.Exists(folder)) Directory.Delete(folder, true); }
             File.WriteAllText(output, new JavaScriptSerializer().Serialize(new { ok = error == null, checks = checks, error = error }), Encoding.UTF8);
             return error == null ? 0 : 1;
         }
@@ -151,7 +178,7 @@ namespace DevlinInstaller {
             string logs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"DevlinDeskLauncher\logs"); Directory.CreateDirectory(logs);
             logpath = Path.Combine(logs, DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".log"); logfile = new StreamWriter(logpath, false, new UTF8Encoding(false)) { AutoFlush = true };
             var logLabel = new Label { Text = "Журнал: " + logpath, AutoEllipsis = true, Dock = DockStyle.Fill }; layout.Controls.Add(logLabel, 0, 9); layout.SetColumnSpan(logLabel, 3);
-            Append("Devlin Desk Launcher 1.10.0 — Windows x64"); SetBusy(false);
+            Append("Devlin Desk Launcher 1.10.3 — Windows x64"); SetBusy(false);
             target.TextChanged += delegate { if (!busy) SetBusy(false); };
             FormClosing += delegate(object sender, FormClosingEventArgs e) { if (busy) { e.Cancel = true; status.Text = "Дождитесь завершения установки. Ход работы виден в журнале."; } };
             FormClosed += delegate { logfile.Dispose(); };

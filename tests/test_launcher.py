@@ -34,5 +34,5 @@ def test_native_launcher_process_and_icon(tmp_path):
     result = subprocess.run([str(EXE), '--self-test-output', str(report)], timeout=60)
     data = json.loads(report.read_text(encoding='utf-8-sig'))
     assert result.returncode == 0, data
-    assert data['ok'] and len(data['checks']) == 4, data
+    assert data['ok'] and len(data['checks']) == 5, data
     verify_executable_icon(EXE, ROOT / 'dashboard/assets/devlin-desk.ico', group_identifier=32512)

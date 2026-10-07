@@ -382,6 +382,20 @@ def test_launcher_check_rejects_missing_or_failed_reports(tmp_path, monkeypatch)
         installer.verify_launcher(release, tmp_path)
     def good(args, **kwargs):
         assert Path(args[0]).name == 'DevlinLauncher.exe'
-        Path(args[-1]).write_text(json.dumps({'ok': True, 'checks': ['resources', 'args', 'paths', 'process']}), encoding='utf-8-sig')
+        Path(args[-1]).write_text(json.dumps({'ok': True, 'checks': ['resources', 'args', 'paths', 'process', 'detached-cwd']}), encoding='utf-8-sig')
     monkeypatch.setattr(installer, 'run', good)
     installer.verify_launcher(release, tmp_path)
+
+
+@pytest.mark.parametrize('winerror', [32, 33])
+def test_sharing_lock_explains_folder_handles_instead_of_security_policies(monkeypatch, winerror):
+    monkeypatch.setattr(installer.time, 'sleep', lambda seconds: None)
+    def denied():
+        error = PermissionError('folder is held open')
+        error.winerror = winerror
+        raise error
+    with pytest.raises(installer.InstallError) as raised:
+        installer.retry_windows_lock(denied, 'Preserving previous application')
+    assert 'terminal windows' in str(raised.value)
+    assert 'current directory' in str(raised.value)
+    assert 'Protection history' not in str(raised.value)

@@ -78,7 +78,7 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            expect(page.locator('#app-version')).to_have_text('v1.10.2')
+            expect(page.locator('#app-version')).to_have_text('v1.10.3')
             assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == 'light'
             assert page.evaluate("parseFloat(getComputedStyle(document.body).fontSize)") >= 16
             page.locator('[data-nav=ssh-profiles]').click()
@@ -231,7 +231,7 @@ def main():
             page.locator('[data-git-action=check]').click()
             expect(page.get_by_text('Репозиторий не подключён. Выберите его через кнопку «Подключить репозиторий».',exact=True)).to_be_visible()
             page.locator('[data-git-action=attach]').click()
-            expect(page.locator('#git-connect-info')).to_contain_text('Версия приложения: v1.10.2')
+            expect(page.locator('#git-connect-info')).to_contain_text('Версия приложения: v1.10.3')
             expect(page.locator('#git-server-key-field')).not_to_be_visible()
             expect(page.locator('#git-connect-auth-hint')).to_contain_text('HTTPS и токен')
             page.locator('#git-repository-picker').click()
