@@ -213,7 +213,7 @@ def test_updater_bundle_is_self_contained_and_records_source_root(tmp_path):
     source=Path(__file__).resolve().parents[1]
     release=release_at(tmp_path/'release','new')
     installer.write_launchers(release,source,source,{'method':'local','commit':'abc'})
-    for name in ('install-windows.ps1','package_windows.py','check-running.ps1','launch-update.ps1'):
+    for name in ('install-windows.ps1','package_windows.py','check-running.ps1','launch-update.ps1','refresh-icons.ps1'):
         assert (release/'maintenance'/name).is_file()
     launcher=(release/'Update-Devlin.cmd').read_text()
     assert 'start "Devlin Desk Update" powershell.exe' in launcher

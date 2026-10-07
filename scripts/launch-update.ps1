@@ -6,7 +6,7 @@ try {
     New-Item -ItemType Directory -Path $temporary | Out-Null
     # Run maintenance from TEMP: no .cmd, Python code or PowerShell file is held open
     # in the installation folder while that folder is replaced.
-    foreach ($name in @("install-windows.ps1", "package_windows.py", "check-running.ps1")) {
+    foreach ($name in @("install-windows.ps1", "package_windows.py", "check-running.ps1", "refresh-icons.ps1")) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $temporary $name)
     }
     $arguments = @{ Action = "Update"; TargetDirectory = $TargetDirectory }

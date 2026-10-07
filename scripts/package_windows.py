@@ -183,6 +183,7 @@ def download_sources(work):
 def validate_source(source):
     for name in ('run.py', 'requirements-desktop.txt', 'dashboard/static/index.html',
                  'dashboard/assets/devlin-desk.ico', 'dashboard/assets/devlin-desk.png',
+                 'scripts/refresh-icons.ps1',
                  'scripts/install-windows.ps1', 'scripts/package_windows.py', 'scripts/check-running.ps1', 'scripts/launch-update.ps1'):
         if not (source / name).is_file():
             raise InstallError(f'Missing source file: {name}')
@@ -226,7 +227,7 @@ def build(source, root, work):
 def write_launchers(release, source, root, metadata):
     maintenance = release / 'maintenance'
     maintenance.mkdir()
-    for name in ('install-windows.ps1', 'package_windows.py', 'check-running.ps1', 'launch-update.ps1'):
+    for name in ('install-windows.ps1', 'package_windows.py', 'check-running.ps1', 'launch-update.ps1', 'refresh-icons.ps1'):
         shutil.copy2(source / 'scripts' / name, maintenance / name)
     (release / 'Update-Devlin.cmd').write_text('''@echo off
 start "Devlin Desk Update" powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0maintenance\\launch-update.ps1" -TargetDirectory "%~dp0." %*

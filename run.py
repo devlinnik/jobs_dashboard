@@ -31,6 +31,9 @@ def desktop_self_test(output=None):
             from PIL import Image
             with Image.open(ASSETS / 'devlin-desk.ico') as icon:
                 icon.load()
+            if getattr(sys, 'frozen', False):
+                from dashboard.windows_icon import verify_executable_icon
+                verify_executable_icon(sys.executable, ASSETS / 'devlin-desk.ico')
         with tempfile.TemporaryDirectory(prefix='devlin-self-test-') as directory:
             with socket.socket() as sock:
                 sock.bind(('127.0.0.1', 0))
@@ -64,6 +67,8 @@ def desktop_self_test(output=None):
                 checks = ['local-api', 'isolated-data', 'html', 'javascript', 'css', 'application-icons']
                 if sys.platform == 'win32':
                     checks.append('tray-dependencies')
+                    if getattr(sys, 'frozen', False):
+                        checks.append('embedded-exe-icon')
                 result = {'ok': True, 'checks': checks}
             finally:
                 server.should_exit = True

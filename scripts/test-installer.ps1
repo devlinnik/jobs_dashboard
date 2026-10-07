@@ -73,4 +73,27 @@ $global:devlinInstallerTestProcesses = @([pscustomobject]@{ Path = (Join-Path $t
 $rejected = $false
 try { & (Join-Path $PSScriptRoot "check-running.ps1") -TargetDirectory $target } catch { $rejected = $true }
 Assert-True $rejected "Running target installation was not blocked"
+# Check Shell notifications without calling native Shell APIs or changing real caches.
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+namespace Devlin {
+    public static class ShellIcons {
+        public static List<string> Calls = new List<string>();
+        public static void SHChangeNotify(uint eventId, uint flags, string path, IntPtr other) {
+            Calls.Add(eventId.ToString() + ":" + flags.ToString() + ":" + path);
+        }
+    }
+}
+'@
+$iconTestFolder = Join-Path ([IO.Path]::GetTempPath()) ("DevlinIconTest-" + [guid]::NewGuid().ToString("N"))
+try {
+    New-Item -ItemType Directory -Path $iconTestFolder | Out-Null
+    [IO.File]::WriteAllText((Join-Path $iconTestFolder "DevlinDesk.exe"), "not an executable")
+    & (Join-Path $PSScriptRoot "refresh-icons.ps1") -TargetDirectory $iconTestFolder
+    Assert-True ([Devlin.ShellIcons]::Calls[0] -eq ("8192:8197:" + (Join-Path $iconTestFolder "DevlinDesk.exe"))) "EXE change notification did not use the correct Unicode path"
+    Assert-True ([Devlin.ShellIcons]::Calls[[Devlin.ShellIcons]::Calls.Count - 1] -eq "134217728:8192:") "Shell icon cache invalidation was not requested"
+} finally {
+    Remove-Item -LiteralPath $iconTestFolder -Recurse -Force
+}
 Write-Host "Installer PowerShell checks passed: $testCount"

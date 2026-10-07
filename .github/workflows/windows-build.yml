@@ -40,6 +40,7 @@ jobs:
           if ($process.ExitCode -ne 0) { throw 'Packaged startup failed' }
           $result = Get-Content $report -Raw | ConvertFrom-Json
           if (-not $result.ok) { throw 'Packaged readiness report is invalid' }
+          if ('embedded-exe-icon' -notin $result.checks) { throw 'Embedded EXE icon was not verified' }
       - uses: actions/upload-artifact@v4
         with:
           name: DevlinDesk-Windows

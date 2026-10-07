@@ -141,13 +141,18 @@ try {
             $shortcut = $shell.CreateShortcut((Join-Path $desktop "Devlin Desk.lnk"))
             $shortcut.TargetPath = $result.executable
             $shortcut.WorkingDirectory = $TargetDirectory
-            $shortcut.IconLocation = $result.executable + ",0"
+            $shortcut.IconLocation = (Join-Path $TargetDirectory "runtime\dashboard\assets\devlin-desk.ico") + ",0"
             $shortcut.Description = "Devlin Desk - project monitoring"
             $shortcut.Save()
             Write-Host "Desktop shortcut created: Devlin Desk"
         } catch {
             Write-Warning "The application is installed, but the desktop shortcut could not be created. Run DevlinDesk.exe from the application folder."
         }
+    }
+    try {
+        & (Join-Path $PSScriptRoot "refresh-icons.ps1") -TargetDirectory $TargetDirectory
+    } catch {
+        Write-Warning "The application is installed, but Windows icon refresh failed: $($_.Exception.Message). Reopen Explorer or sign out and back in if it still shows the old icon."
     }
     Write-Host "Done. Run $($result.executable)"
     if ($result.backup) { Write-Host "Rollback copy: $($result.backup)" }
