@@ -66,6 +66,10 @@ def main():
         server_files = temp/'server'; server_files.mkdir()
         (server_files/'index.php').write_text('<?php echo "Initial";')
         (server_files/'hosting-link').symlink_to('missing-target')
+        (server_files/'muha/audio').mkdir(parents=True)
+        legacy_name = 'muha/audio/Песня - Привет.mp3'.encode('cp1251')
+        with open(os.fsencode(server_files) + b'/' + legacy_name, 'wb') as output:
+            output.write(b'\x00MP3 sample')
         (server_files/'cache').mkdir(); (server_files/'cache/result.txt').write_text('keep ignored')
         (server_files/'server.log').write_text('keep log')
         bare = git_host['bare']
@@ -78,7 +82,7 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            expect(page.locator('#app-version')).to_have_text('v1.10.6')
+            expect(page.locator('#app-version')).to_have_text('v1.10.7')
             assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == 'light'
             assert page.evaluate("parseFloat(getComputedStyle(document.body).fontSize)") >= 16
             page.locator('[data-nav=ssh-profiles]').click()
@@ -217,7 +221,11 @@ def main():
             expect(page.locator('#gitignore-dialog')).not_to_be_visible(timeout=20000)
             expect(page.locator('#gitignore-status')).to_contain_text('Файл существует', timeout=20000)
             assert (server_files/'cache/result.txt').read_text() == 'keep ignored'
-            expect(page.locator('.git-file')).to_have_count(3)
+            expect(page.locator('.git-file')).to_have_count(4)
+            expect(page.locator('.file-name').filter(has_text='Песня - Привет.mp3')).to_contain_text('имя в байтах')
+            assert '\ufffd' not in page.locator('.file-list').inner_text()
+            page.locator('.file-row').filter(has_text='Песня - Привет.mp3').locator('.view-diff').click()
+            expect(page.locator('#file-diff')).to_contain_text('Двоичный файл: текстовый просмотр недоступен.')
             page.locator('[data-git-action=ignore]').click()
             expect(page.locator('#gitignore-content')).to_be_enabled(timeout=20000)
             assert '# Server project rules' in page.locator('#gitignore-content').input_value()
@@ -231,7 +239,7 @@ def main():
             page.locator('[data-git-action=check]').click()
             expect(page.get_by_text('Репозиторий не подключён. Выберите его через кнопку «Подключить репозиторий».',exact=True)).to_be_visible()
             page.locator('[data-git-action=attach]').click()
-            expect(page.locator('#git-connect-info')).to_contain_text('Версия приложения: v1.10.6')
+            expect(page.locator('#git-connect-info')).to_contain_text('Версия приложения: v1.10.7')
             expect(page.locator('#git-server-key-field')).not_to_be_visible()
             expect(page.locator('#git-connect-auth-hint')).to_contain_text('HTTPS и токен')
             page.locator('#git-repository-picker').click()
@@ -270,6 +278,7 @@ def main():
             assert (server_files/'.gitignore').exists()
             page.locator('[data-git-action=commit]').click()
             expect(page.locator('#confirm-dialog')).to_be_visible()
+            expect(page.locator('#confirm-extra')).to_contain_text('Песня - Привет.mp3')
             page.locator('#confirm-accept').click()
             try:
                 expect(page.get_by_text('Рабочая директория чистая. Изменений для коммита нет.')).to_be_visible(timeout=20000)
@@ -287,6 +296,8 @@ def main():
             page.locator('#confirm-accept').click()
             expect(page.locator('#outgoing-commits')).to_have_count(0, timeout=20000)
             assert subprocess.check_output(['git','-C',str(bare),'show','main:index.php']).decode() == '<?php echo "Initial";'
+            tracked_names = subprocess.check_output(['git','-C',str(bare),'ls-tree','-rz','--name-only','main']).split(b'\0')
+            assert legacy_name in tracked_names
             assert subprocess.check_output(['git','-C',str(bare),'show','main:hosting-link']).decode() == 'missing-target'
             page.screenshot(path=str(screenshot/'git-notification.png'), animations='disabled')
             (server_files/'index.php').write_text('<?php echo "Updated on server";')

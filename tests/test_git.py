@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -625,3 +626,77 @@ def test_failed_file_is_identified_after_successful_files(repo):
     assert git(work, 'rev-parse', 'HEAD') == before
     assert git(work, 'show', ':good.txt') == 'content'
     assert (work / 'bad.txt').read_text() == 'content'
+
+
+@POSIX_ONLY
+def test_legacy_filename_bytes_survive_preview_snapshot_and_full_commit(tmp_path):
+    work = tmp_path / 'legacy'; work.mkdir()
+    names = ['muha/audio/Песня - Привет.mp3'.encode('cp1251'),
+             'muha/audio/Песня - Привет.mp3'.encode('utf-8'),
+             b'muha/audio/invalid-\x98-$(touch OWNED).mp3',
+             b'muha/audio/literal-\\xcf.mp3', b'muha/audio/literal-\xcf.mp3']
+    (work / 'muha/audio').mkdir(parents=True)
+    for number, name in enumerate(names):
+        with open(os.fsencode(work) + b'/' + name, 'wb') as output:
+            output.write(b'\x00MP3' + bytes([number]))
+    conn = LocalConnection(work)
+    preview = gitops.status(conn)
+    assert len(preview['files']) == len(names)
+    assert len({f['path'] for f in preview['files']}) == len(names)
+    assert {gitops.path_bytes(f) for f in preview['files']} == set(names)
+    assert all(f['allowed'] for f in preview['files'])
+    assert '\ufffd' not in json.dumps(preview, ensure_ascii=False)
+    git(work, 'init', '-b', 'main')
+    current = gitops.status(conn)
+    legacy = next(f for f in current['files'] if gitops.path_bytes(f) == names[0])
+    assert legacy['display_path'] == 'muha/audio/Песня - Привет.mp3'
+    assert gitops.diff(conn, legacy['path']) == 'Двоичный файл: текстовый просмотр недоступен.'
+    before = current['snapshot']
+    with open(os.fsencode(work) + b'/' + names[0], 'ab') as output: output.write(b'changed')
+    current = gitops.status(conn)
+    assert current['snapshot'] != before
+    gitops.sync(conn, SimpleNamespace(snapshot=current['snapshot'], files=[f['path'] for f in current['files']], message='All bytes', push=False),
+                {'git_name':'Test','git_email':'test@example.com'})
+    tracked = subprocess.check_output(['git', '-C', str(work), 'ls-tree', '-rz', '--name-only', 'HEAD'])
+    assert set(tracked.split(b'\0')[:-1]) == set(names)
+    assert not (work / 'OWNED').exists()
+    assert not gitops.status(conn)['files']
+
+
+@POSIX_ONLY
+def test_legacy_preview_blocks_symlinks_and_limits_content(repo):
+    work, conn = repo
+    name = 'Ссылка.txt'.encode('cp1251')
+    target = work / 'outside.txt'; target.write_text('private')
+    os.symlink(os.fsencode(target), os.fsencode(work) + b'/' + name)
+    state = gitops.status(conn)
+    file = next(f for f in state['files'] if gitops.path_bytes(f) == name)
+    with pytest.raises(RemoteError, match='символьной ссылки'):
+        gitops.diff(conn, file['path'])
+    os.unlink(os.fsencode(work) + b'/' + name)
+    with open(os.fsencode(work) + b'/' + name, 'wb') as output: output.write(b'a' * 120000)
+    assert gitops.diff(conn, file['path']) == 'Файл превышает 100 КБ. Откройте его на сервере.'
+
+
+@POSIX_ONLY
+def test_legacy_rename_and_deletion_use_original_bytes(repo):
+    work, conn = repo
+    old = 'Старое.txt'.encode('cp1251'); new = 'Новое.txt'.encode('cp1251')
+    with open(os.fsencode(work) + b'/' + old, 'wb') as output: output.write(b'same contents')
+    git(work, 'add', '-A'); git(work, 'commit', '-m', 'Old')
+    os.rename(os.fsencode(work) + b'/' + old, os.fsencode(work) + b'/' + new)
+    # A staged rename also exercises byte-preserving index snapshots and unstage.
+    git(work, 'add', '-A')
+    current = gitops.status(conn)
+    rename = current['files'][0]
+    assert gitops.path_bytes(rename, 'old_path') == old
+    assert gitops.path_bytes(rename) == new
+    gitops.unstage(conn, SimpleNamespace(snapshot=current['snapshot'], index_snapshot=current['index_snapshot'], confirm=True))
+    current = gitops.status(conn)
+    gitops.sync(conn, SimpleNamespace(snapshot=current['snapshot'], files=[f['path'] for f in current['files']], message='Rename', push=False),
+                {'git_name':'Test','git_email':'test@example.com'})
+    os.unlink(os.fsencode(work) + b'/' + new)
+    current = gitops.status(conn)
+    gitops.sync(conn, SimpleNamespace(snapshot=current['snapshot'], files=[f['path'] for f in current['files']], message='Delete', push=False),
+                {'git_name':'Test','git_email':'test@example.com'})
+    assert not gitops.status(conn)['files']

@@ -13,6 +13,39 @@ EXCLUDED_DIRS = {'.git', '.ssh', '.venv', 'venv', 'node_modules', 'vendor', '__p
 SECRET_NAMES = {'.env', 'id_rsa', 'id_ed25519', 'credentials.json', 'vault.key', 'desk.sqlite3', 'auth.json'}
 
 
+def path_fields(raw, key='path'):
+    """JSON-safe, reversible identity; never replace filename bytes used by Git."""
+    text = raw.decode('utf-8', errors='surrogateescape')
+    identity = ''.join('\\\\' if c == '\\' else '\\x%02x' % (ord(c) - 0xdc00)
+                       if 0xdc80 <= ord(c) <= 0xdcff else c for c in text)
+    fields = {key: identity}
+    if identity != text:
+        fields['raw_' + key] = raw.hex()
+        # CP1251 is a display hint only. Commands always use the original bytes.
+        fields['display_' + key] = raw.decode('cp1251', errors='backslashreplace') if any(0xdc80 <= ord(c) <= 0xdcff for c in text) else text
+    return fields
+
+
+def path_bytes(item, key='path'):
+    return bytes.fromhex(item['raw_' + key]) if 'raw_' + key in item else item[key].encode('utf-8')
+
+
+def quote_path(item, key='path'):
+    raw = path_bytes(item, key)
+    try:
+        return shlex.quote(raw.decode('utf-8'))
+    except UnicodeDecodeError:
+        # ASCII-only SSH command; POSIX printf reconstructs the exact bytes.
+        return '"$(printf ' + shlex.quote(''.join('\\%03o' % b for b in raw)) + ')"'
+
+
+def raw_output(conn, command):
+    code, out, err = conn.run(command)
+    if code:
+        raise command_failure(code, err + b'\n' + out)
+    return out
+
+
 def safe_file(path):
     p = PurePosixPath(path)
     if not path or p.is_absolute() or '..' in p.parts or any(c in path for c in '\x00\r\n'):
@@ -201,14 +234,14 @@ def attach(conn, request):
 
 def snapshot(conn, raw, files, head=''):
     # Include actual file content hashes: stale previews cannot stage a later edit silently.
-    paths = [f['path'] for f in files if safe_file(f['path'])]
+    paths = [f for f in files if f['allowed']]
     hashes = ''
     for start in range(0, len(paths), 100):
         batch = paths[start:start + 100]
         # Fingerprint raw bytes, not clean-filter output. A symlink stores its target
         # string in Git; never read the target file or traverse a linked directory.
         # The sentinel preserves trailing newlines through shell substitution.
-        command = 'devlin_file_index=0; for f in ' + ' '.join(shlex.quote(p) for p in batch) + '; do '
+        command = 'devlin_file_index=0; for f in ' + ' '.join(quote_path(p) for p in batch) + '; do '
         command += ('devlin_file_index=$((devlin_file_index + 1)); '
             'if test -L "$f"; then '
             'if devlin_link=$(readlink -- "$f" && printf "."); then '
@@ -222,7 +255,8 @@ def snapshot(conn, raw, files, head=''):
         if code:
             match = re.search(rb'\nDEVLIN_HASH_ERROR:(\d+)\n', out)
             index = int(match.group(1)) - 1 if match else -1
-            path = batch[index] if 0 <= index < len(batch) else '(пакет файлов)'
+            item = batch[index] if 0 <= index < len(batch) else {}
+            path = item.get('display_path', item.get('path', '(пакет файлов)'))
             raise command_failure(code, err, 'Проверка содержимого файла «' + path + '»')
         hashes += out.decode('utf-8', errors='replace')
     return hashlib.sha256((conn.path + '\0' + head + raw + hashes).encode()).hexdigest()
@@ -232,14 +266,14 @@ def candidates(conn):
     # Preview through a disposable Git directory outside the project. This applies
     # existing .gitignore/global excludes before initialization, without creating .git.
     excludes = ' '.join('--exclude=' + shlex.quote(p + '/') for p in sorted(EXCLUDED_DIRS))
-    raw = conn.text('devlin_git_preview=$(mktemp -d "${TMPDIR:-/tmp}/devlin-git-preview.XXXXXX") || exit; '
+    raw = raw_output(conn, 'devlin_git_preview=$(mktemp -d "${TMPDIR:-/tmp}/devlin-git-preview.XXXXXX") || exit; '
         'trap \'rm -rf -- "$devlin_git_preview"\' EXIT; '
         'git init --bare -q "$devlin_git_preview" && '
         'git --git-dir="$devlin_git_preview" --work-tree=. ls-files --others --exclude-standard -z ' + excludes)
-    paths = sorted(p for p in raw.split('\x00') if p)
+    paths = sorted(p for p in raw.split(b'\x00') if p)
     if len(paths) > 2000:
         raise RemoteError('Первичная загрузка ограничена 2000 файлами. Исключите зависимости и архивы перед подключением.')
-    return [{'path': p, 'status': '??', 'allowed': safe_file(p)} for p in paths]
+    return [{**path_fields(p), 'status': '??', 'allowed': safe_file(p.decode('utf-8', errors='surrogateescape'))} for p in paths]
 
 
 def status(conn, include_snapshot=True):
@@ -255,17 +289,18 @@ def status(conn, include_snapshot=True):
     real = conn.text('pwd -P').strip()
     if root != real:
         raise RemoteError('Указанная директория находится внутри другого репозитория. Укажите корень Git-проекта.')
-    raw = conn.text('git status --porcelain=v1 -z --untracked-files=all')
-    parts, files = raw.split('\x00'), []
+    raw_bytes = raw_output(conn, 'git status --porcelain=v1 -z --untracked-files=all')
+    raw = raw_bytes.hex()
+    parts, files = raw_bytes.split(b'\x00'), []
     i = 0
     while i < len(parts) and parts[i]:
         entry = parts[i]
-        flag, path = entry[:2], entry[3:]
-        item = {'status': flag, 'path': path, 'allowed': safe_file(path)}
+        flag, path = entry[:2].decode('ascii'), entry[3:]
+        item = {'status': flag, **path_fields(path), 'allowed': safe_file(path.decode('utf-8', errors='surrogateescape'))}
         if 'R' in flag or 'C' in flag:
             i += 1
-            item['old_path'] = parts[i]
-            item['allowed'] = item['allowed'] and safe_file(parts[i])
+            item.update(path_fields(parts[i], 'old_path'))
+            item['allowed'] = item['allowed'] and safe_file(parts[i].decode('utf-8', errors='surrogateescape'))
         files.append(item)
         i += 1
     if len(files) > 2000:
@@ -282,7 +317,7 @@ def status(conn, include_snapshot=True):
         except RemoteError:
             remote = '(адрес скрыт: небезопасный URL; настройте SSH remote на сервере)'
     staged = any(f['status'][0] not in (' ', '?') for f in files)
-    index_snapshot = hashlib.sha256(conn.text('git ls-files --stage -z').encode()).hexdigest() if staged and include_snapshot else ''
+    index_snapshot = hashlib.sha256(raw_output(conn, 'git ls-files --stage -z')).hexdigest() if staged and include_snapshot else ''
     return {'connected': True, 'files': files, 'snapshot': snapshot(conn, raw, files, head) if include_snapshot else '',
             'branch': branch, 'head': head[:12], 'remote': remote,
             'staged': staged, 'index_snapshot': index_snapshot}
@@ -294,19 +329,35 @@ def diff(conn, path):
     current = status(conn)
     if path not in [f['path'] for f in current['files']]:
         raise RemoteError('Файл отсутствует в текущем списке изменений')
-    if not current['connected'] or next(f for f in current['files'] if f['path'] == path)['status'] == '??':
-        with conn.client.open_sftp() as sftp:
-            if stat.S_ISLNK(sftp.lstat(conn.path.rstrip('/') + '/' + path).st_mode):
+    item = next(f for f in current['files'] if f['path'] == path)
+    if not item['allowed']:
+        raise RemoteError('Просмотр потенциально секретного файла отключён')
+    if not current['connected'] or item['status'] == '??':
+        if 'raw_path' in item:
+            # SFTP servers/libraries can insist on UTF-8 paths. Read the bounded
+            # preview through an ASCII shell command for byte-encoded names.
+            quoted = quote_path(item)
+            code, content, err = conn.run('devlin_preview_path=' + quoted + '; '
+                'if test -L "$devlin_preview_path"; then exit 43; fi; '
+                'head -c 100001 -- "$devlin_preview_path"', max_output=110_000)
+            if code == 43:
                 raise RemoteError('Просмотр содержимого символьной ссылки запрещён')
-            with sftp.open(conn.path.rstrip('/') + '/' + path, 'rb') as f:
-                content = f.read(100_001)
+            if code:
+                raise command_failure(code, err, 'Просмотр файла «' + item.get('display_path', path) + '»')
+        else:
+            with conn.client.open_sftp() as sftp:
+                remote_path = conn.path.rstrip('/') + '/' + path
+                if stat.S_ISLNK(sftp.lstat(remote_path).st_mode):
+                    raise RemoteError('Просмотр содержимого символьной ссылки запрещён')
+                with sftp.open(remote_path, 'rb') as f:
+                    content = f.read(100_001)
         if len(content) > 100_000:
             return 'Файл превышает 100 КБ. Откройте его на сервере.'
         if b'\x00' in content:
             return 'Двоичный файл: текстовый просмотр недоступен.'
         return content.decode('utf-8', errors='replace')
     base = 'HEAD' if current['head'] else '--cached'
-    return conn.text('git --literal-pathspecs diff --no-ext-diff ' + base + ' -- ' + shlex.quote(path), max_output=200_000) or 'Нет текстового diff (например, изменение прав файла).'
+    return conn.text('git --literal-pathspecs diff --no-ext-diff ' + base + ' -- ' + quote_path(item), max_output=200_000) or 'Нет текстового diff (например, изменение прав файла).'
 
 
 def author_identity(conn, settings):
@@ -455,20 +506,21 @@ def commit(conn, current, files, message, settings, push=False):
         raise RemoteError('Текущая ветка сервера отличается от выбранной: ' + configured_branch)
     if '\x00' in message:
         raise RemoteError('Некорректное сообщение коммита')
-    paths = list(files)
+    lookup = {f['path']: f for f in current['files']}
+    paths = [(lookup[path], 'path') for path in files]
     identity = author_identity(conn, settings)
     for item in current['files']:
         if item['path'] in files and item.get('old_path'):
-            paths.append(item['old_path'])
+            paths.append((item, 'old_path'))
     hosting = getattr(conn, 'project', {}).get('hosting', False)
     local_git = 'git -c core.preloadIndex=false -c index.threads=1 -c pack.threads=1' if hosting else 'git'
     report = getattr(conn, 'report_progress', lambda *args: None)
     report('Добавление файлов в индекс', 0, len(paths))
-    for number, path in enumerate(paths, 1):
+    for number, (item, key) in enumerate(paths, 1):
         # One literal path per command: no large argument lists, and a failure
         # names exactly the file that failed rather than the first batch entries.
-        conn.text('LC_ALL=C ' + local_git + ' --literal-pathspecs add -A -- ' + shlex.quote(path),
-                  context='Добавление файла в индекс Git «' + path + '»')
+        conn.text('LC_ALL=C ' + local_git + ' --literal-pathspecs add -A -- ' + quote_path(item, key),
+                  context='Добавление файла в индекс Git «' + item.get('display_' + key, item[key]) + '»')
         report('Добавление файлов в индекс', number, len(paths))
     report('Создание коммита', len(paths), len(paths))
     # If a hook fails, do not undo the server index or overwrite the user's work.
