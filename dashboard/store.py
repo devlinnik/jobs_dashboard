@@ -47,10 +47,23 @@ class Store:
             CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id TEXT, level TEXT, message TEXT, created_at TEXT);
+            CREATE TABLE IF NOT EXISTS git_debug (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT, data TEXT, created_at TEXT);
         ''')
         self.db.commit()
         (self.directory / 'desk.sqlite3').chmod(0o600)
         self.migrate_ssh_profiles()
+
+    def git_debug_record(self, project_id, data):
+        with self.lock, self.db:
+            self.db.execute('INSERT INTO git_debug(project_id,data,created_at) VALUES (?,?,?)',
+                            (project_id, json.dumps(data), now()))
+            self.db.execute('DELETE FROM git_debug WHERE id NOT IN (SELECT id FROM git_debug ORDER BY id DESC LIMIT 2000)')
+
+    def git_debug_records(self, project_id):
+        with self.lock:
+            rows = self.db.execute('SELECT data,created_at FROM git_debug WHERE project_id=? ORDER BY id DESC LIMIT 300', (project_id,)).fetchall()
+        return [dict(json.loads(data), created_at=created_at) for data, created_at in reversed(rows)]
 
     def encrypt(self, value):
         return self.vault.encrypt(value.encode()).decode() if value else ''

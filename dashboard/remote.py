@@ -102,6 +102,8 @@ class Connection:
         self.path = project['ssh_path']
 
     def run(self, command, timeout=35, max_output=2_000_000, in_project=True, input_data=None):
+        self.last_command_metrics = {}
+        debug_hint = ' Откройте «Git & файлы → Отчёт Git» и скопируйте отчёт.' if getattr(self, 'git_trace_active', False) else ''
         if in_project and not self.path:
             raise RemoteError('Папка проекта не выбрана. Откройте SSH-проводник в настройках проекта.')
         full = ('cd -- ' + shlex.quote(self.path) + ' && ' if in_project else '') + command
@@ -116,13 +118,15 @@ class Connection:
             channel.shutdown_write()
             while True:
                 if time.monotonic() > deadline:
-                    raise RemoteError('SSH-команда превысила время ожидания. Проверьте состояние на сервере перед повтором.')
+                    self.last_command_metrics = {'result': 'timeout', 'stdout_bytes':len(stdout), 'stderr_bytes':len(stderr)}
+                    raise RemoteError('SSH-команда превысила время ожидания. Проверьте состояние на сервере перед повтором.' + debug_hint)
                 if channel.recv_ready():
                     stdout.extend(channel.recv(65536))
                 if channel.recv_stderr_ready():
                     stderr.extend(channel.recv_stderr(65536))
                 if len(stdout) + len(stderr) > max_output:
-                    raise RemoteError('Ответ сервера слишком большой. Сократите число файлов или размер diff.')
+                    self.last_command_metrics = {'result': 'output_limit', 'stdout_bytes':len(stdout), 'stderr_bytes':len(stderr)}
+                    raise RemoteError(('Ответ сервера слишком большой: получено %s байт при лимите %s.' % (len(stdout)+len(stderr), max_output)) + debug_hint)
                 if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
                     return channel.recv_exit_status(), bytes(stdout), bytes(stderr)
                 time.sleep(0.015)

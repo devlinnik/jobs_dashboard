@@ -19,6 +19,7 @@ from .remote import connect, inspect_host, RemoteError
 from .monitor import Monitor, probe_script
 from . import gitops
 from . import gitignore
+from .gitdebug import trace_commands
 from .version import app_info
 from .gitprovider import Provider
 
@@ -288,6 +289,8 @@ def create_app(directory=None, start_monitor=True):
 
     async def operation(pid, fn, *args, require_project=True, progress_id=''):
         record = None
+        trace_id = uuid.uuid4().hex[:12]
+        debug_git = fn.__module__ in ('dashboard.gitops', 'dashboard.gitignore')
         if progress_id:
             try:
                 progress_id = str(uuid.UUID(progress_id))
@@ -311,8 +314,15 @@ def create_app(directory=None, start_monitor=True):
                             def report(stage, completed=0, total=0):
                                 record.update(stage=stage, completed=completed, total=total, updated=time.monotonic())
                             conn.report_progress = report
+                        if debug_git:
+                            with trace_commands(conn, lambda data: store.git_debug_record(pid, data), fn.__name__, trace_id):
+                                return fn(conn, *args)
                         return fn(conn, *args)
                 return await asyncio.to_thread(execute)
+        except Exception:
+            if debug_git:
+                store.event(pid, 'error', 'Git: операция ' + fn.__name__ + ' завершилась ошибкой. Отчёт ' + trace_id + ' доступен в «Git & файлы → Отчёт Git».')
+            raise
         finally:
             if record is not None:
                 record.update(done=True, updated=time.monotonic())
@@ -324,6 +334,12 @@ def create_app(directory=None, start_monitor=True):
         if not record or record['pid'] != pid:
             raise HTTPException(404, 'Операция ещё не началась или завершена')
         return {key: record[key] for key in ('stage', 'completed', 'total', 'done')}
+
+    @app.get('/api/projects/{pid}/git/debug', dependencies=auth)
+    async def git_debug_report(pid: str):
+        store.project(pid)
+        return {'version':app_info()['version'], 'records':store.git_debug_records(pid),
+                'note':'Последние 300 команд проекта. Хранятся максимум 2000 команд. Аргументы, токены, пароли, stdin и содержимое stdout/stderr не записываются. Причины ошибок классифицированы.'}
 
     @app.post('/api/projects/{pid}/ssh/test', dependencies=auth)
     async def test_ssh(pid: str):
