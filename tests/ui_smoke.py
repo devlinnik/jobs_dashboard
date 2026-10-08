@@ -74,7 +74,7 @@ def main():
         (server_files/'server.log').write_text('keep log')
         bare = git_host['bare']
         ssh_env = {'GIT_SSL_CAINFO':str(git_host['ca']), 'NO_PROXY':'127.0.0.1,localhost',
-                   'GIT_CONFIG_GLOBAL':str(temp/'ssh-gitconfig')}
+                   'GIT_CONFIG_GLOBAL':str(temp/'ssh-gitconfig'), 'HOME':str(temp)}
         ssh_port, key = stack.enter_context(ssh_server(ssh_env, home=str(temp), writable=True))
         with sync_playwright() as playwright:
             executable = os.environ.get('CHROMIUM_PATH')
@@ -84,7 +84,7 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            expect(page.locator('#app-version')).to_have_text('v1.10.8')
+            expect(page.locator('#app-version')).to_have_text('v1.10.9')
             assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == 'light'
             assert page.evaluate("parseFloat(getComputedStyle(document.body).fontSize)") >= 16
             page.locator('[data-nav=ssh-profiles]').click()
@@ -238,10 +238,21 @@ def main():
             expect(page.locator('#git-diagnostics-dialog')).to_be_visible(timeout=20000)
             expect(page.locator('#git-diagnostics-content')).to_contain_text('В корне проекта ещё нет Git-репозитория.')
             page.locator('[data-close=git-diagnostics-dialog]').first.click()
+            (server_files/'.git').mkdir()
+            (server_files/'.git/important-original').write_text('keep original metadata')
+            page.locator('[data-git-action=refresh]').click()
+            expect(page.locator('#git-recovery-panel')).to_contain_text('.git/HEAD: отсутствует', timeout=20000)
+            page.locator('[data-git-repair="archive-reinitialize"]').click()
+            expect(page.locator('#confirm-description')).to_contain_text('пустую историю')
+            page.locator('#confirm-accept').click()
+            expect(page.locator('[data-git-action=commit]')).to_be_enabled(timeout=20000)
+            backups = list((temp/'.devlin-git-backups').rglob('important-original'))
+            assert len(backups) == 1 and backups[0].read_text() == 'keep original metadata'
+            assert (server_files/'index.php').read_text() == '<?php echo "Initial";'
             page.locator('[data-git-action=check]').click()
             expect(page.get_by_text('Репозиторий не подключён. Выберите его через кнопку «Подключить репозиторий».',exact=True)).to_be_visible()
             page.locator('[data-git-action=attach]').click()
-            expect(page.locator('#git-connect-info')).to_contain_text('Версия приложения: v1.10.8')
+            expect(page.locator('#git-connect-info')).to_contain_text('Версия приложения: v1.10.9')
             expect(page.locator('#git-server-key-field')).not_to_be_visible()
             expect(page.locator('#git-connect-auth-hint')).to_contain_text('HTTPS и токен')
             page.locator('#git-repository-picker').click()

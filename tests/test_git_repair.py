@@ -71,11 +71,54 @@ def test_metadata_symlink_prevents_recursive_permission_repair(repo, tmp_path):
 def test_invalid_metadata_is_diagnosed_without_reinitialization(tmp_path):
     work = tmp_path/'broken'; work.mkdir(); (work/'.git').mkdir()
     (work/'.git/important').write_text('preserve')
-    report = gitops.diagnostics(LocalConnection(work), {})
-    assert not report['actions']
-    assert any('не распознана' in c['message'] for c in report['checks'])
+    report = gitops.diagnostics(LocalConnection(work, {'HOME':str(tmp_path)}), {})
+    assert {a['id'] for a in report['actions']} == {'archive-reinitialize'}
+    assert any('.git/HEAD: отсутствует' in c['message'] for c in report['checks'])
     assert (work/'.git/important').read_text() == 'preserve'
     assert not (work/'.git/HEAD').exists()
+
+
+def test_restore_missing_head_preserves_history_index_and_server_files(repo, tmp_path):
+    work, conn = repo
+    conn.env['HOME'] = str(tmp_path)
+    before = git(work,'rev-parse','HEAD')
+    index = (work/'.git/index').read_bytes()
+    (work/'.git/HEAD').unlink()
+    (work/'index.php').write_text('server changes')
+    report = gitops.recovery(conn)
+    assert 'restore-head' in {a['id'] for a in report['actions']}
+    result = gitops.repair(conn, request(report,'restore-head'))
+    assert git(work,'rev-parse','HEAD') == before
+    assert (work/'.git/index').read_bytes() == index
+    assert (work/'index.php').read_text() == 'server changes'
+    assert os.path.isdir(result['backup']+'/original.git/objects')
+
+
+def test_archive_broken_metadata_requires_consent_and_keeps_complete_backup(tmp_path):
+    work = tmp_path/'site'; work.mkdir(); (work/'.git').mkdir()
+    (work/'.git/keep').write_bytes(b'original data')
+    (work/'index.php').write_text('site content')
+    conn = LocalConnection(work, {'HOME':str(tmp_path)})
+    report = gitops.recovery(conn)
+    with pytest.raises(RemoteError,match='Подтвердите'):
+        gitops.repair(conn, request(report,'archive-reinitialize',confirm=False))
+    assert (work/'.git/keep').read_bytes() == b'original data'
+    result = gitops.repair(conn, request(report,'archive-reinitialize'))
+    assert open(result['backup']+'/original.git/keep','rb').read() == b'original data'
+    assert (work/'index.php').read_text() == 'site content'
+    assert gitops.status(conn)['connected'] and not gitops.status(conn)['head']
+
+
+def test_broken_git_file_is_backed_up_without_touching_external_repository(tmp_path):
+    work = tmp_path/'site'; work.mkdir()
+    original = b'gitdir: D:/old-pc/missing/.git\n'
+    (work/'.git').write_bytes(original)
+    conn = LocalConnection(work, {'HOME':str(tmp_path)})
+    report = gitops.recovery(conn)
+    assert any('файл ссылки' in c['message'] for c in report['checks'])
+    result = gitops.repair(conn, request(report,'archive-reinitialize'))
+    assert open(result['backup']+'/original.git','rb').read() == original
+    assert gitops.status(conn)['connected']
 
 
 @pytest.mark.parametrize('remote,expected', [

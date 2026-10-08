@@ -214,7 +214,7 @@ class GitUnstageInput(BaseModel):
 
 
 class GitRepairInput(BaseModel):
-    action: str = Field(pattern='^(trust-directory|owner-permissions|profile-https)$')
+    action: str = Field(pattern='^(trust-directory|owner-permissions|profile-https|restore-head|archive-reinitialize)$')
     snapshot: str = Field(min_length=64, max_length=64)
     confirm: bool = False
 

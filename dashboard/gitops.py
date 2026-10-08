@@ -4,12 +4,13 @@ import json
 import re
 import shlex
 import stat
+import uuid
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 from .remote import RemoteError, command_failure
 from .gitprovider import Provider, repository_path
 
-EXCLUDED_DIRS = {'.git', '.ssh', '.venv', 'venv', 'node_modules', 'vendor', '__pycache__', '.idea'}
+EXCLUDED_DIRS = {'.git', '.ssh', '.venv', 'venv', 'node_modules', 'vendor', '__pycache__', '.idea', '.devlin-git-backups'}
 SECRET_NAMES = {'.env', 'id_rsa', 'id_ed25519', 'credentials.json', 'vault.key', 'desk.sqlite3', 'auth.json'}
 
 
@@ -51,6 +52,8 @@ def safe_file(path):
     if not path or p.is_absolute() or '..' in p.parts or any(c in path for c in '\x00\r\n'):
         return False
     if any(part in EXCLUDED_DIRS for part in p.parts):
+        return False
+    if any(part.startswith('.devlin-git-new.') for part in p.parts):
         return False
     name = p.name.lower()
     if name in SECRET_NAMES or (name.startswith('.env.') and name not in ('.env.example', '.env.sample', '.env.dist')):
@@ -281,6 +284,8 @@ def status(conn, include_snapshot=True):
     if code:
         metadata, _, _ = conn.run('test -e .git || test -L .git')
         if metadata == 0:
+            if b'not a git repository' in (err + b'\n' + out).lower():
+                raise RemoteError('В папке уже есть .git, но Git её не распознал. Ниже показаны проверка структуры и доступные действия восстановления.')
             raise command_failure(code, err + b'\n' + out, 'В папке уже есть .git, но репозиторий недоступен. Запустите диагностику и исправление в приложении')
         files = candidates(conn) if include_snapshot else []
         raw = json.dumps(files, sort_keys=True)
@@ -392,12 +397,35 @@ def recovery(conn):
         if test_code == 0 and test_root.decode('utf-8', errors='replace').strip() == root:
             actions.append({'id': 'trust-directory', 'label': 'Доверять папке проекта',
                 'description': 'Добавить ' + root + ' в safe.directory текущего SSH-пользователя. Разрешение касается только этого проекта. Файлы, владельцы и коммиты сохраняются.'})
+    structure = {}
+    if code and meta_code == 0 and 'not a git repository' in error:
+        for name, kind in (('HEAD','f'), ('objects','d'), ('refs','d'), ('config','f')):
+            path = shlex.quote('.git/' + name)
+            probe, _, _ = conn.run('if ! test -e ' + path + ' && ! test -L ' + path + '; then exit 41; fi; '
+                'test -' + kind + ' ' + path + ' || exit 42; test -r ' + path + ' || exit 43')
+            structure[name] = probe
+            label = {0:'доступен',41:'отсутствует',42:'неверный тип или повреждённая ссылка',43:'нет прав чтения'}.get(probe,'недоступен')
+            checks.append({'ok': probe == 0, 'message': '.git/' + name + ': ' + label + '.'})
+        head_code, head, _ = conn.run('head -c 8192 -- .git/HEAD')
+        structure['head_bytes'] = head.hex() if head_code == 0 else ''
+        if structure['HEAD'] == 0:
+            head_valid = bool(re.fullmatch(rb'(?:ref: refs/[^\x00\r\n ]+|[0-9a-f]{40}|[0-9a-f]{64})\n?', head))
+            structure['head_valid'] = head_valid
+            if not head_valid:
+                checks.append({'ok': False, 'message': '.git/HEAD имеет неверный формат: Git не может определить текущую ветку.'})
+        config_code, _, _ = conn.run('git config --file .git/config --list')
+        structure['config_code'] = config_code
+        if structure['config'] == 0 and config_code:
+            checks.append({'ok': False, 'message': '.git/config содержит некорректные настройки. Его содержимое сохранится в резервной копии.'})
+        pointer_code, pointer, _ = conn.run('test -f .git && head -c 8192 -- .git')
+        structure['pointer'] = pointer.hex() if pointer_code == 0 else ''
+        if pointer_code == 0:
+            checks.append({'ok': False, 'message': '.git — файл ссылки на другой Git-каталог. Указанный каталог не открывается; возможен перенос проекта с другого ПК или сервера.'})
     elif code and meta_code == 0:
         checks.append({'ok': False, 'message': str(command_failure(code, err + b'\n' + out, 'Открытие существующего Git'))})
-        checks.append({'ok': None, 'message': 'Приложение сохраняет существующую .git. Она не будет удалена или заменена новым репозиторием.'})
     # A recursive chmod is offered only for a traversable, wholly user-owned,
     # non-symlink metadata tree. Worktree files and permissions of others stay intact.
-    own_code, _, _ = conn.run('test -d .git && ! test -L .git && '
+    own_code, _, _ = conn.run('(test -d .git || test -f .git) && ! test -L .git && '
         'test -z "$(find .git -xdev \\( -type l -o ! -uid ' + uid + ' \\) -print -quit)" && '
         'find .git -xdev -type d -print >/dev/null')
     mode_code, modes, _ = conn.run('find .git -xdev \\( -type f ! -perm -u+r -o '
@@ -408,6 +436,44 @@ def recovery(conn):
             'description': 'Добавить владельцу чтение файлов .git и чтение, запись и проход по её папкам. Права остальных пользователей, содержимое файлов и история сохраняются; Git-объекты остаются защищены от изменения.'})
     if meta_code == 0 and own_code != 0:
         checks.append({'ok': None, 'message': 'Нельзя безопасно изменить права .git: внутри есть чужие файлы, ссылки или недоступные папки. Выберите SSH-профиль владельца проекта в настройках; приложение не может получить права другого пользователя.'})
+    backup_base = ''
+    if structure and own_code == 0 and mode_code == 0 and not modes:
+        manifest_code, manifest, _ = conn.run("find .git -xdev -printf '%P:%y:%s:%T@:%m:%u:%g\\0'")
+        structure['manifest'] = hashlib.sha256(manifest).hexdigest() if manifest_code == 0 else ''
+        home_code, home_out, _ = conn.run('cd -- "$HOME" && pwd -P')
+        home = home_out.decode('utf-8', errors='replace').strip()
+        if home_code == 0 and home.startswith('/') and home != '/' and not any(c in home for c in '\0\r\n'):
+            backup_base = home + '/.devlin-git-backups/' + hashlib.sha256(root.encode()).hexdigest()[:24]
+            writable, _, _ = conn.run('test -w ' + shlex.quote(home) + ' && ! test -L ' + shlex.quote(home + '/.devlin-git-backups') + ' && ! test -L ' + shlex.quote(backup_base))
+            if writable == 0 and manifest_code == 0:
+                branch = getattr(conn, 'project', {}).get('git_branch') or 'main'
+                try:
+                    validate_branch(branch)
+                except RemoteError:
+                    branch = ''
+                broken_structure = (any(structure.get(p, 0) for p in ('HEAD','objects','refs')) or
+                                    structure.get('head_valid') is False or
+                                    (structure.get('config') == 0 and config_code != 0))
+                if branch and broken_structure:
+                    structure['branch'] = branch
+                    refs_code, refs, _ = conn.run('find .git/refs/heads -type f -print; test ! -f .git/packed-refs || cat .git/packed-refs')
+                    # Restore HEAD only when the chosen branch exists, or no
+                    # branches exist yet. Do not guess among existing histories.
+                    has_branch = (('.git/refs/heads/' + branch).encode() in refs.splitlines() or
+                                  any(line.endswith((' refs/heads/' + branch).encode()) for line in refs.splitlines()))
+                    other_branches = bool(refs.strip())
+                    if (structure['HEAD'] == 41 or structure.get('head_valid') is False) and structure['objects'] == 0 and structure['refs'] == 0 and config_code == 0 and (has_branch or not other_branches):
+                        actions.append({'id':'restore-head','label':'Восстановить HEAD',
+                            'description':'Сохранить копию метаданных в ' + backup_base + ' и восстановить ссылку HEAD на ветку ' + branch + '. Объекты Git, индекс, коммиты и файлы сайта сохраняются.'})
+                    root_write, _, _ = conn.run('test -w .')
+                    structure['root_write'] = root_write
+                    if root_write == 0:
+                        actions.append({'id':'archive-reinitialize','label':'Сохранить .git и настроить заново',
+                            'description':'Перенести всю неисправную .git в резервную копию ' + backup_base + ' и создать новый Git в ветке ' + branch + '. Файлы сайта останутся на месте. Новый Git начнёт пустую историю; исходная .git останется в резервной копии, её история не будет перенесена в новый Git. После этого подключите репозиторий через приложение.'})
+                    else:
+                        checks.append({'ok': False, 'message':'SSH-пользователь не может изменять корень проекта. Для переустановки метаданных выберите профиль владельца этой папки.'})
+    if structure and not actions:
+        checks.append({'ok': None, 'message': 'Автоматическое восстановление недоступно для текущих прав или структуры. В настройках проекта можно выбрать правильную папку и SSH-профиль её владельца.'})
     remote = ''
     if code == 0:
         _, raw_remote, _ = conn.run('git config --get remote.origin.url')
@@ -425,8 +491,8 @@ def recovery(conn):
     project = getattr(conn, 'project', {})
     snapshot = hashlib.sha256(json.dumps([root, uid, meta_code, meta.hex(), code, remote,
         {key:project.get(key, '') for key in ('id','ssh_host','ssh_port','ssh_user','ssh_fingerprint','git_profile_id')},
-        profile.get('id', ''), profile.get('base_url', ''), actions], sort_keys=True).encode()).hexdigest()
-    return {'checks': checks, 'actions': actions, 'repair_snapshot': snapshot}
+        profile.get('id', ''), profile.get('base_url', ''), structure, actions], sort_keys=True).encode()).hexdigest()
+    return {'checks': checks, 'actions': actions, 'repair_snapshot': snapshot, 'backup_base':backup_base, 'structure':structure}
 
 
 def profile_https_url(profile, remote):
@@ -451,7 +517,31 @@ def repair(conn, request):
         raise RemoteError('Состояние Git изменилось. Повторите диагностику перед исправлением.')
     if request.action not in {a['id'] for a in current['actions']}:
         raise RemoteError('Для текущей проблемы это исправление недоступно. Повторите диагностику.')
-    if request.action == 'trust-directory':
+    backup = ''
+    if request.action in ('restore-head','archive-reinitialize'):
+        backup = current['backup_base'] + '/' + uuid.uuid4().hex
+        branch = current['structure']['branch']
+        base = shlex.quote(current['backup_base']); dest = shlex.quote(backup)
+        conn.text('umask 077; mkdir -p -- ' + base + ' && mkdir -- ' + dest, context='Создание папки резервной копии Git')
+        if request.action == 'restore-head':
+            conn.text('cp -a -- .git ' + shlex.quote(backup + '/original.git'), timeout=90, context='Резервная копия Git перед восстановлением HEAD')
+            latest = recovery(conn)
+            if latest['repair_snapshot'] != request.snapshot:
+                raise RemoteError('Метаданные изменились. Резервная копия сохранена; повторите диагностику.')
+            conn.text('devlin_head=$(mktemp .git/HEAD.devlin.XXXXXX) || exit; '
+                'trap \'rm -f -- "$devlin_head"\' EXIT; '
+                '(test ! -f .git/HEAD || chmod --reference=.git/HEAD "$devlin_head") && '
+                'printf "%s\\n" ' + shlex.quote('ref: refs/heads/' + branch) + ' > "$devlin_head" && mv -- "$devlin_head" .git/HEAD', context='Восстановление HEAD')
+        else:
+            # Prepare fresh metadata before archiving the original. The final
+            # install is a same-directory rename; no checkout or reset occurs.
+            conn.text('umask 077; devlin_new_git=$(mktemp -d .devlin-git-new.XXXXXX) || exit; '
+                'trap \'rm -rf -- "$devlin_new_git"\' EXIT; '
+                'git init --bare --template= -b ' + shlex.quote(branch) + ' "$devlin_new_git" && '
+                'git --git-dir="$devlin_new_git" config core.bare false && '
+                'mv -- .git ' + shlex.quote(backup + '/original.git') + ' && '
+                '(mv -- "$devlin_new_git" .git || { test -e .git || mv -- ' + shlex.quote(backup + '/original.git') + ' .git; exit 1; })', timeout=90, context='Сохранение неисправной .git и настройка нового Git')
+    elif request.action == 'trust-directory':
         root = conn.text('pwd -P').strip()
         conn.text('git config --global --add safe.directory ' + shlex.quote(root), context='Разрешение папки Git')
     elif request.action == 'owner-permissions':
@@ -472,7 +562,9 @@ def repair(conn, request):
         conn.run('git config --unset-all remote.origin.pushurl')
     # Verify the operation, without changing the index, worktree or history.
     conn.text('git rev-parse --is-inside-work-tree', context='Проверка Git после исправления')
-    return {'ok': True, 'message': 'Настройки Git исправлены. Файлы и коммиты сохранены. Обновите состояние репозитория.'}
+    message = ('Создан новый Git. Файлы сайта сохранены. Подключите репозиторий через приложение. Старая .git сохранена в ' + backup
+               if request.action == 'archive-reinitialize' else 'Настройки Git исправлены. Файлы и коммиты сохранены. Обновите состояние репозитория.' + (' Резервная копия: ' + backup if backup else ''))
+    return {'ok': True, 'message': message, 'backup':backup}
 
 
 def diagnostics(conn, settings):
@@ -487,7 +579,8 @@ def diagnostics(conn, settings):
     try:
         current = status(conn, include_snapshot=False)
     except RemoteError as exc:
-        checks.append({'ok': False, 'message': str(exc)})
+        if not any(c['ok'] is False for c in checks):
+            checks.append({'ok': False, 'message': str(exc)})
         return {**recovered, 'checks': checks}
     if not current['connected']:
         checks.append({'ok': False, 'message': 'В корне проекта ещё нет Git-репозитория.'})
