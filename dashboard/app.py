@@ -20,6 +20,7 @@ from .monitor import Monitor, probe_script
 from . import gitops
 from . import gitignore
 from .gitdebug import trace_commands
+from .models import CommitAllInput, GitReconcileInput
 from .version import app_info
 from .gitprovider import Provider
 
@@ -576,6 +577,24 @@ def create_app(directory=None, start_monitor=True):
         elif result['pushed']:
             previous.pop('pending_push', None)
         store.save_state(pid, previous)
+        monitor.due[pid] = 0
+        return result
+
+    @app.post('/api/projects/{pid}/git/commit-all', dependencies=auth)
+    async def git_commit_all(pid: str, body: CommitAllInput, request: Request):
+        result = await operation(pid, gitops.commit_all, body, store.settings(), progress_id=request.headers.get('X-Devlin-Operation', ''))
+        store.event(pid, 'success', 'Коммит ' + result['commit'] + ' создан из всех изменений проекта. Отправка в origin выполняется отдельно.')
+        monitor.due[pid] = 0
+        return result
+
+    @app.post('/api/projects/{pid}/git/reconcile-plan', dependencies=auth)
+    async def git_reconcile_plan(pid: str, request: Request):
+        return await operation(pid, gitops.reconcile_plan, store.settings(), progress_id=request.headers.get('X-Devlin-Operation', ''))
+
+    @app.post('/api/projects/{pid}/git/reconcile', dependencies=auth)
+    async def git_reconcile(pid: str, body: GitReconcileInput, request: Request):
+        result = await operation(pid, gitops.reconcile_server, body, store.settings(), progress_id=request.headers.get('X-Devlin-Operation', ''))
+        store.event(pid, 'success', result['message'] + ' Коммит ' + result['commit'])
         monitor.due[pid] = 0
         return result
 

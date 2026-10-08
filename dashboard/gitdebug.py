@@ -8,6 +8,8 @@ from .remote import command_failure
 
 def command_label(command):
     for pattern, label in (
+        (r'\bcommit-tree\b', 'git commit-tree'),
+        (r'\bupdate-ref\b', 'git update-ref'),
         (r'\bls-remote\b', 'git ls-remote'),
         (r'\bfetch\b', 'git fetch'),
         (r'\bpush\b', 'git push'),

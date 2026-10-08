@@ -226,6 +226,20 @@ class SyncInput(BaseModel):
     push: bool = False
 
 
+class CommitAllInput(BaseModel):
+    snapshot: str = Field(min_length=64, max_length=64)
+    message: str = Field(min_length=1, max_length=500)
+    confirm: bool = False
+
+
+class GitReconcileInput(BaseModel):
+    expected_head: str = Field(pattern='^(?:[0-9a-f]{40}|[0-9a-f]{64})$')
+    expected_remote_tip: str = Field(pattern='^(?:[0-9a-f]{40}|[0-9a-f]{64})$')
+    expected_branch: str = Field(min_length=1, max_length=100)
+    expected_remote: str = Field(max_length=2048)
+    confirm: bool = False
+
+
 class InitInput(SyncInput):
     remote: str = Field(max_length=2048)
     branch: str = Field(default='main', min_length=1, max_length=100)

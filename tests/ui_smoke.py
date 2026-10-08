@@ -85,7 +85,7 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            expect(page.locator('#app-version')).to_have_text('v1.10.12')
+            expect(page.locator('#app-version')).to_have_text('v1.10.13')
             assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == 'light'
             assert page.evaluate("parseFloat(getComputedStyle(document.body).fontSize)") >= 16
             page.locator('[data-nav=ssh-profiles]').click()
@@ -264,7 +264,7 @@ def main():
             page.locator('[data-git-action=check]').click()
             expect(page.get_by_text('Репозиторий не подключён. Выберите его через кнопку «Подключить репозиторий».',exact=True)).to_be_visible()
             page.locator('[data-git-action=attach]').click()
-            expect(page.locator('#git-connect-info')).to_contain_text('Версия приложения: v1.10.12')
+            expect(page.locator('#git-connect-info')).to_contain_text('Версия приложения: v1.10.13')
             expect(page.locator('#git-server-key-field')).not_to_be_visible()
             expect(page.locator('#git-connect-auth-hint')).to_contain_text('HTTPS и токен')
             page.locator('#git-repository-picker').click()
@@ -350,18 +350,46 @@ def main():
             assert subprocess.check_output(['git','-C',str(bare),'show','main:hosting-link']).decode() == 'missing-target'
             page.screenshot(path=str(screenshot/'git-notification.png'), animations='disabled')
             (server_files/'index.php').write_text('<?php echo "Updated on server";')
+            (server_files/'vendor').mkdir()
+            (server_files/'vendor/library.php').write_text('included by explicit whole-project commit')
             page.locator('[data-git-action=refresh]').click()
-            expect(page.locator('.git-file')).to_have_count(1)
+            expect(page.locator('.git-file')).to_have_count(2)
             assert page.locator('#detail-dialog').evaluate('node => node.scrollHeight <= node.clientHeight + 1'), 'Project dialog has an extra outer scrollbar'
             page.locator('[data-file-diff]').click()
             expect(page.locator('#file-diff')).to_contain_text('Updated on server')
-            page.locator('[data-git-action=commit]').click(); page.locator('#confirm-accept').click()
+            page.locator('[data-git-action=commit-all]').click()
+            expect(page.locator('#operation-region')).to_contain_text('Проверка и создание коммита всего проекта')
+            expect(page.locator('#confirm-description')).to_contain_text('2 изменений')
+            expect(page.locator('#confirm-description')).to_contain_text('Отключённые в списке файлы')
+            page.locator('#confirm-accept').click()
             expect(page.get_by_text('Рабочая директория чистая. Изменений для коммита нет.')).to_be_visible(timeout=20000)
             expect(page.locator('#outgoing-commits .commit-row')).to_have_count(1, timeout=20000)
             assert subprocess.check_output(['git','-C',str(bare),'show','main:index.php']).decode() == '<?php echo "Initial";'
             page.locator('#git-history-panel [data-git-action=push]').click(); page.locator('#confirm-accept').click()
             expect(page.locator('#outgoing-commits')).to_have_count(0, timeout=20000)
             assert 'Updated on server' in subprocess.check_output(['git','-C',str(bare),'show','main:index.php']).decode()
+            assert subprocess.check_output(['git','-C',str(bare),'show','main:vendor/library.php']).decode() == 'included by explicit whole-project commit'
+            remote_work = temp/'remote-edit'
+            subprocess.run(['git','clone','-b','main',str(bare),str(remote_work)],check=True,capture_output=True)
+            for name,value in (('user.name','Origin Author'),('user.email','origin@example.com')):
+                subprocess.run(['git','-C',str(remote_work),'config',name,value],check=True)
+            (remote_work/'README.md').write_text('Remote-only change')
+            subprocess.run(['git','-C',str(remote_work),'add','.'],check=True)
+            subprocess.run(['git','-C',str(remote_work),'commit','-m','New commit in origin'],check=True,capture_output=True)
+            subprocess.run(['git','-C',str(remote_work),'push','origin','main'],check=True,capture_output=True)
+            original_tree = subprocess.check_output(['git','-C',str(server_files),'rev-parse','HEAD^{tree}'])
+            page.locator('[data-git-action=refresh]').click()
+            expect(page.locator('[data-git-action=reconcile]')).to_be_visible(timeout=20000)
+            page.locator('[data-git-action=reconcile]').click()
+            expect(page.locator('#confirm-description')).to_contain_text('Итоговое содержимое Git')
+            expect(page.locator('#confirm-description')).to_contain_text('при последующей отправке их заменит версия сервера')
+            page.locator('#confirm-accept').click()
+            expect(page.locator('#outgoing-commits .commit-row')).to_have_count(1,timeout=20000)
+            assert not (server_files/'README.md').exists()
+            assert subprocess.check_output(['git','-C',str(server_files),'rev-parse','HEAD^{tree}']) == original_tree
+            page.locator('#git-history-panel [data-git-action=push]').click(); page.locator('#confirm-accept').click()
+            expect(page.locator('#outgoing-commits')).to_have_count(0,timeout=20000)
+            assert len(subprocess.check_output(['git','-C',str(bare),'log','-1','--format=%P']).split()) == 2
             page.locator('[data-tab=events]').click()
             expect(page.locator('#detail-content .event-row')).not_to_have_count(0)
             page.locator('[data-close=detail-dialog]').click()

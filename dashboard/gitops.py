@@ -141,6 +141,7 @@ def validate_branch(branch):
 def network(conn, arguments, remote):
     """Supply credentials through SSH stdin and process environment, never URL/argv/disk."""
     validate_remote(remote)
+    network_timeout = 600 if arguments.startswith(('push ', 'fetch ')) else 90
     getattr(conn, 'report_progress', lambda *args: None)('Отправка коммитов' if arguments.startswith('push ') else 'Проверка удалённого репозитория', 0, 0)
     profile = getattr(conn, 'git_profile', None)
     # The server may select a non-default key using core.sshCommand. A fixed
@@ -157,7 +158,7 @@ def network(conn, arguments, remote):
               'GIT_SSH_COMMAND="$devlin_git_ssh -o BatchMode=yes -o StrictHostKeyChecking=yes" ')
 
     if not profile:
-        return conn.run(setup + common + 'git ' + arguments, timeout=90)
+        return conn.run(setup + common + 'git ' + arguments, timeout=network_timeout)
     repository_path(profile, remote)  # Never send a profile's token to another service.
     version = conn.text('git --version').strip()
     match = re.search(r'(\d+)\.(\d+)', version)
@@ -186,7 +187,7 @@ def network(conn, arguments, remote):
         script += f'GIT_CONFIG_KEY_{index}=' + shlex.quote(key) + ' '
         script += f'GIT_CONFIG_VALUE_{index}=' + ('"Authorization: Basic $DEVLIN_GIT_AUTH"' if value is None else shlex.quote(value)) + ' '
     script += 'git -c protocol.file.allow=never -c protocol.ext.allow=never ' + arguments
-    return conn.run(script, timeout=90, input_data=(authorization + '\n').encode())
+    return conn.run(script, timeout=network_timeout, input_data=(authorization + '\n').encode())
 
 
 def access_settings(conn):
@@ -763,11 +764,11 @@ def fetch_commits(conn, settings):
     return history(conn, settings, remote_tip=tip)
 
 
-def commit(conn, current, files, message, settings, push=False):
+def commit(conn, current, files, message, settings, push=False, *, all_changes=False):
     if current.get('staged'):
         raise RemoteError('На сервере уже есть подготовленные изменения. В разделе «Git & файлы» нажмите «Убрать подготовку к коммиту», затем выберите файлы заново.')
     allowed = {f['path'] for f in current['files'] if f['allowed']}
-    if len(set(files)) != len(files) or any(p not in allowed for p in files):
+    if not all_changes and (len(set(files)) != len(files) or any(p not in allowed for p in files)):
         raise RemoteError('Выбранные файлы больше не входят в допустимые изменения. Обновите список: .gitignore, исключённые пути или изменения на сервере могли изменить набор. Файлы не добавлены в индекс.')
     if current.get('branch') == '(detached HEAD)':
         raise RemoteError('HEAD не привязан к ветке. Выберите ветку на сервере.')
@@ -785,20 +786,26 @@ def commit(conn, current, files, message, settings, push=False):
     hosting = getattr(conn, 'project', {}).get('hosting', False)
     local_git = 'git -c core.preloadIndex=false -c index.threads=1 -c pack.threads=1' if hosting else 'git'
     report = getattr(conn, 'report_progress', lambda *args: None)
-    report('Добавление файлов в индекс', 0, len(paths))
+    if all_changes:
+        report('Добавление всех изменений проекта в индекс Git', 0, 0)
+        conn.text('LC_ALL=C GIT_TERMINAL_PROMPT=0 ' + local_git + ' add -A -- .', timeout=600,
+                  context='Добавление всех изменений проекта в индекс Git')
+    else:
+        report('Добавление файлов в индекс', 0, len(paths))
     for number, (item, key) in enumerate(paths, 1):
         # One literal path per command: no large argument lists, and a failure
         # names exactly the file that failed rather than the first batch entries.
         conn.text('LC_ALL=C ' + local_git + ' --literal-pathspecs add -A -- ' + quote_path(item, key),
                   context='Добавление файла в индекс Git «' + item.get('display_' + key, item[key]) + '»')
         report('Добавление файлов в индекс', number, len(paths))
-    report('Создание коммита', len(paths), len(paths))
+    report('Создание одного коммита из всех изменений' if all_changes else 'Создание коммита', len(paths), len(paths))
     # If a hook fails, do not undo the server index or overwrite the user's work.
     environment = ' '.join(key + '=' + shlex.quote(value) for key,value in (
         ('GIT_AUTHOR_NAME',identity['name']), ('GIT_AUTHOR_EMAIL',identity['email']),
         ('GIT_COMMITTER_NAME',identity['name']), ('GIT_COMMITTER_EMAIL',identity['email'])))
     conn.text('LC_ALL=C ' + environment + ' ' + local_git + ' -c user.name=' + shlex.quote(identity['name']) + ' -c user.email=' + shlex.quote(identity['email']) +
-              ' commit -m ' + shlex.quote(message), timeout=90, context='Создание коммита из подготовленных файлов')
+              (' commit --quiet -m ' if all_changes else ' commit -m ') + shlex.quote(message),
+              timeout=600 if all_changes else 90, context='Создание коммита из подготовленных файлов')
     head = conn.text('git rev-parse --short HEAD').strip()
     result = {'commit': head, 'pushed': False, 'warning': '', 'author': identity}
     if push:
@@ -817,6 +824,73 @@ def commit(conn, current, files, message, settings, push=False):
     return result
 
 
+def commit_all(conn, request, settings):
+    """Explicit whole-project commit; gitignore applies, selector filtering does not."""
+    if not request.confirm:
+        raise RemoteError('Подтвердите создание коммита из всех изменений проекта.')
+    getattr(conn, 'report_progress', lambda *args: None)('Проверка всего проекта перед коммитом', 0, 0)
+    current = status(conn)
+    if not current['connected']:
+        raise RemoteError('Сначала подключите локальный Git через приложение.')
+    if request.snapshot != current['snapshot']:
+        raise RemoteError('Изменения проекта поменялись после просмотра. Обновите список и подтвердите коммит заново.')
+    if not current['files']:
+        raise RemoteError('Изменений для коммита нет.')
+    return commit(conn, current, [], request.message, settings, all_changes=True)
+
+
+def reconcile_plan(conn, settings):
+    """Review a merge of histories whose resulting tree is the committed server tree."""
+    getattr(conn, 'report_progress', lambda *args: None)('Проверка истории origin и сервера', 0, 0)
+    current = status(conn, include_snapshot=False)
+    if not current['connected'] or not current['head'] or not current['remote']:
+        raise RemoteError('Подключите origin и сначала создайте коммит файлов сервера.')
+    enforce_branch(conn, current)
+    if current['files']:
+        raise RemoteError('Сначала сохраните изменения сервера кнопкой «Создать коммит из всех изменений» или коммитом выбранных файлов. Объединение истории требует чистого проекта; файлы сервера не изменены.')
+    history_data = fetch_commits(conn, settings)
+    if not history_data['behind']:
+        raise RemoteError('Новых коммитов origin для объединения нет. Обновите список и отправьте свои коммиты.')
+    branch = validate_branch(history_data['branch'])
+    tip = conn.text('git rev-parse --verify ' + shlex.quote('refs/remotes/origin/' + branch)).strip()
+    if not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', tip):
+        raise RemoteError('Не удалось определить коммит origin.')
+    summary = conn.text('LC_ALL=C git diff --no-ext-diff --no-textconv --shortstat ' + tip + ' ' + history_data['head'], timeout=600).strip()
+    return {'expected_head':history_data['head'], 'expected_remote_tip':tip,
+            'expected_branch':branch, 'expected_remote':history_data['remote'],
+            'behind':history_data['behind'], 'ahead':history_data['ahead'], 'summary':summary,
+            'remote_commits':log_commits(conn, history_data['head'] + '..' + tip)}
+
+
+def reconcile_server(conn, request, settings):
+    if not request.confirm:
+        raise RemoteError('Подтвердите объединение истории с сохранением версии сервера.')
+    plan = reconcile_plan(conn, settings)
+    if any(getattr(request, key) != plan[key] for key in ('expected_head','expected_remote_tip','expected_branch','expected_remote')):
+        raise RemoteError('История сервера или origin изменилась после просмотра. Обновите план объединения и подтвердите заново.')
+    identity = author_identity(conn, settings)
+    environment = ' '.join(key + '=' + shlex.quote(value) for key,value in (
+        ('GIT_AUTHOR_NAME',identity['name']), ('GIT_AUTHOR_EMAIL',identity['email']),
+        ('GIT_COMMITTER_NAME',identity['name']), ('GIT_COMMITTER_EMAIL',identity['email'])))
+    report = getattr(conn, 'report_progress', lambda *args: None)
+    report('Объединение истории без изменения файлов сервера', 0, 0)
+    tree = conn.text('git rev-parse ' + plan['expected_head'] + '^{tree}').strip()
+    if not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', tree):
+        raise RemoteError('Не удалось проверить дерево коммита сервера.')
+    message = 'Devlin Desk: merge origin/' + plan['expected_branch'] + ', keep server version'
+    merged = conn.text(environment + ' git -c user.name=' + shlex.quote(identity['name']) + ' -c user.email=' + shlex.quote(identity['email']) +
+        ' commit-tree ' + tree + ' -p ' + plan['expected_head'] + ' -p ' + plan['expected_remote_tip'] + ' -m ' + shlex.quote(message), timeout=600,
+        context='Создание коммита объединения истории').strip()
+    if not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', merged):
+        raise RemoteError('Не удалось проверить коммит объединения истории.')
+    # Compare-and-swap only the branch ref. Index and website files stay intact.
+    if conn.text('git symbolic-ref --short -q HEAD').strip() != plan['expected_branch']:
+        raise RemoteError('Ветка сервера изменилась; объединение не применено.')
+    conn.text('git update-ref ' + shlex.quote('refs/heads/' + plan['expected_branch']) + ' ' + merged + ' ' + plan['expected_head'],
+              context='Применение объединённой истории')
+    return {'ok':True, 'commit':merged[:12], 'message':'История объединена с сохранением версии сервера. Файлы проекта не изменены. Теперь отправьте коммиты в origin отдельной кнопкой.'}
+
+
 
 def unstage(conn, request):
     """Clear only the index after confirming both worktree and staged object hashes."""
@@ -830,11 +904,11 @@ def unstage(conn, request):
     if conn.text('git ls-files --unmerged -z'):
         raise RemoteError('В индексе есть конфликты слияния. Сначала разрешите их на сервере; подготовка не изменена.')
     if current['head']:
-        conn.text('git reset --mixed HEAD', context='Отмена подготовки файлов к коммиту')
+        conn.text('git reset --mixed --quiet HEAD', timeout=600, context='Отмена подготовки файлов к коммиту')
     else:
         # Unborn branches have no HEAD to reset to. --cached affects only the
         # index; force also allows staged content differing from the worktree.
-        conn.text('git rm --cached -r -f --ignore-unmatch -- .', context='Отмена подготовки первого коммита')
+        conn.text('git rm --cached -r -f --quiet --ignore-unmatch -- .', timeout=600, context='Отмена подготовки первого коммита')
     return {'ok': True, 'message': 'Подготовка к коммиту отменена. Файлы на сервере сохранены; выберите их и создайте коммит.'}
 
 
@@ -916,7 +990,7 @@ def push(conn, request=None, settings=None):
     outgoing = fetch_commits(conn, settings or {'git_name':'Devlin Desk', 'git_email':'desk@localhost'})
     verify_request()
     if outgoing['behind']:
-        raise RemoteError('На origin есть новые коммиты, которых нет на сервере. Сначала обновите чистый проект через pull или согласуйте историю вручную. Force push не выполняется.')
+        raise RemoteError('На origin есть новые коммиты. Сохраните изменения сервера коммитом, затем используйте «Объединить историю с origin» в списке коммитов. Для загрузки версии origin в чистый проект доступно «Загрузить из Git».')
     if outgoing['ahead'] == 0:
         return {'message': 'Неотправленных коммитов нет: текущая ветка уже актуальна.'}
     # Pin the reviewed commit and destination: a concurrent server commit must not
