@@ -63,6 +63,48 @@ def remote_digest(conn, command):
     return code, digest if not code else '', err
 
 
+def status_preview(conn):
+    """Consume the entire NUL-delimited status remotely, send a bounded prefix.
+
+    Keep rename pairs together and observe staged entries beyond the preview.
+    The producer's exit code is retained even though awk drains its output.
+    """
+    awk = r'''BEGIN { RS="\0"; ORS=""; nul=sprintf("%c",0) }
+function keep(entry) {
+    total++;
+    if (substr(entry,1,1)!=" " && substr(entry,1,1)!="?") staged=1;
+    if (!full && kept<2000 && bytes+length(entry)+1<=800000) {
+        preview=preview entry nul; bytes+=length(entry)+1; kept++;
+    } else full=1;
+}
+{
+    if (pending!="") { keep(pending nul $0); pending=""; }
+    else if (substr($0,1,2) ~ /[RC]/) pending=$0;
+    else keep($0);
+}
+END {
+    if (pending!="") exit 44;
+    printf "%d %d %d%c",total,kept,staged,0;
+    printf "%s",preview;
+}'''
+    command = ('devlin_status_dir=$(mktemp -d "${TMPDIR:-/tmp}/devlin-git-status.XXXXXX") || exit; '
+               'trap \'rm -rf -- "$devlin_status_dir"\' EXIT; '
+               '(git status --porcelain=v1 -z --untracked-files=all; devlin_status_code=$?; '
+               'printf "%s\\n" "$devlin_status_code" > "$devlin_status_dir/code") | LC_ALL=C awk ' + shlex.quote(awk) + '; '
+               'devlin_awk_code=$?; test "$devlin_awk_code" -eq 0 || exit "$devlin_awk_code"; '
+               'test -s "$devlin_status_dir/code" || exit 1; '
+               'read -r devlin_status_code < "$devlin_status_dir/code"; exit "$devlin_status_code"')
+    raw = raw_output(conn, command)
+    try:
+        header, preview = raw.split(b'\0', 1)
+        total, shown, staged = map(int, header.split())
+        if not 0 <= shown <= min(total, 2000) or staged not in (0, 1):
+            raise ValueError
+    except (ValueError, TypeError):
+        raise RemoteError('Не удалось прочитать ограниченный список изменений Git')
+    return preview, total, shown, bool(staged)
+
+
 def safe_file(path):
     p = PurePosixPath(path)
     if not path or p.is_absolute() or '..' in p.parts or any(c in path for c in '\x00\r\n'):
@@ -310,8 +352,13 @@ def status(conn, include_snapshot=True):
     real = conn.text('pwd -P').strip()
     if root != real:
         raise RemoteError('Указанная директория находится внутри другого репозитория. Укажите корень Git-проекта.')
-    raw_bytes = raw_output(conn, 'git status --porcelain=v1 -z --untracked-files=all')
+    raw_bytes, total_files, shown_files, staged = status_preview(conn)
     raw = raw_bytes.hex()
+    if include_snapshot and total_files > shown_files:
+        code, digest, error = remote_digest(conn, 'git status --porcelain=v1 -z --untracked-files=all')
+        if code:
+            raise command_failure(code, error, 'Проверка полного списка изменений Git')
+        raw += digest
     parts, files = raw_bytes.split(b'\x00'), []
     i = 0
     while i < len(parts) and parts[i]:
@@ -324,8 +371,8 @@ def status(conn, include_snapshot=True):
             item['allowed'] = item['allowed'] and safe_file(parts[i].decode('utf-8', errors='surrogateescape'))
         files.append(item)
         i += 1
-    if len(files) > 2000:
-        raise RemoteError('Обнаружено больше 2000 изменений. Сократите набор изменений перед синхронизацией.')
+    if len(files) != shown_files:
+        raise RemoteError('Git вернул неполный список изменений. Обновите вкладку Git.')
     code, out, _ = conn.run('git rev-parse --verify HEAD')
     head = out.decode().strip() if code == 0 else ''
     branch_code, branch_out, _ = conn.run('git symbolic-ref --short -q HEAD')
@@ -337,7 +384,6 @@ def status(conn, include_snapshot=True):
             validate_remote(remote)
         except RemoteError:
             remote = '(адрес скрыт: небезопасный URL; настройте SSH remote на сервере)'
-    staged = any(f['status'][0] not in (' ', '?') for f in files)
     index_snapshot = ''
     if staged and include_snapshot:
         index_code, index_snapshot, index_error = remote_digest(conn, 'git ls-files --stage -z')
@@ -345,7 +391,8 @@ def status(conn, include_snapshot=True):
             raise command_failure(index_code, index_error, 'Проверка индекса Git')
     return {'connected': True, 'files': files, 'snapshot': snapshot(conn, raw, files, head) if include_snapshot else '',
             'branch': branch, 'head': head[:12], 'remote': remote,
-            'staged': staged, 'index_snapshot': index_snapshot}
+            'staged': staged, 'index_snapshot': index_snapshot,
+            'total_files': total_files, 'truncated': total_files > shown_files}
 
 
 def diff(conn, path):
@@ -610,6 +657,8 @@ def diagnostics(conn, settings):
         checks.append({'ok': False, 'message': 'В корне проекта ещё нет Git-репозитория.'})
         return {**recovered, 'checks': checks}
     access = access_settings(conn)
+    if current.get('truncated'):
+        checks.append({'ok':None, 'message':'В проекте %s изменений. Показаны первые %s; список ограничен для работы с большим проектом. Исключите ненужные папки через редактор .gitignore или создавайте коммиты из показанных файлов по частям.' % (current['total_files'], len(current['files']))})
     if current['remote'].startswith('https://') and not getattr(conn, 'git_profile', None):
         checks.append({'ok': False, 'message': 'origin использует HTTPS: серверный SSH-ключ здесь не применяется. GitHub не принимает пароль аккаунта для Git. Выберите SSH URL через «Настроить подключение репозитория» или назначьте Git-профиль с токеном.'})
     elif current['remote']:
