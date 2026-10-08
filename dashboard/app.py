@@ -264,6 +264,12 @@ def create_app(directory=None, start_monitor=True):
         store.event(None, 'success', 'Тестовое уведомление Telegram отправлено')
         return {'message': 'Сообщение отправлено в Telegram'}
 
+    @app.post('/api/telegram/report', dependencies=auth)
+    async def telegram_report():
+        if not await monitor.daily_report(manual=True):
+            raise HTTPException(400, 'Отчёт не отправлен. Проверьте бота и получателя; подробности — в журнале.')
+        return {'message':'Отчёт по проектам отправлен в Telegram'}
+
     @app.get('/api/projects/{pid}/ssh/fingerprint', dependencies=auth)
     async def host_fingerprint(pid: str):
         return await asyncio.to_thread(inspect_host, store.resolve_project(store.project(pid)))

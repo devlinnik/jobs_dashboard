@@ -200,7 +200,7 @@ class Store:
 
     def settings(self):
         defaults = {'telegram_token': '', 'telegram_chat': '', 'pin_hash': '',
-                    'git_name': 'Devlin Desk', 'git_email': 'desk@localhost', 'notify_recovery': True, 'telegram_status': {}}
+                    'git_name': 'Devlin Desk', 'git_email': 'desk@localhost', 'notify_recovery': True, 'daily_report': True, 'telegram_status': {}}
         with self.lock:
             row = self.db.execute('SELECT data FROM settings WHERE id=1').fetchone()
             return defaults | (json.loads(row[0]) if row else {})
@@ -224,6 +224,10 @@ class Store:
         with self.lock:
             rows = self.db.execute(query + ' ORDER BY id DESC LIMIT 150', args).fetchall()
         return [dict(zip(['id','project_id','level','message','created_at'], r)) for r in rows]
+
+    def event_counts(self, since):
+        with self.lock:
+            return dict(self.db.execute('SELECT level, COUNT(*) FROM events WHERE created_at >= ? GROUP BY level', (since,)).fetchall())
 
     def close(self):
         self.db.close()

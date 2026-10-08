@@ -171,6 +171,7 @@ class SettingsInput(BaseModel):
     git_name: str = Field(default='Devlin Desk', min_length=1, max_length=100)
     git_email: str = Field(default='desk@localhost', min_length=3, max_length=200)
     notify_recovery: bool = True
+    daily_report: bool = True
     pin: str | None = None
     current_pin: str | None = None
     disable_pin: bool = False

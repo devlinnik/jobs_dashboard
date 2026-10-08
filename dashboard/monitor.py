@@ -4,12 +4,14 @@ import json
 import math
 import secrets
 import time
+from datetime import timedelta, timezone
 from types import SimpleNamespace
 import httpx
 from . import gitops
 from . import telegram as telegram_api
 from .remote import connect, RemoteError
 from .store import now
+from . import reporting
 
 
 def probe_script(token):
@@ -40,6 +42,9 @@ class Monitor:
         self.http = httpx.AsyncClient(timeout=15, follow_redirects=True, trust_env=True)
         self.running = set()
         self.telegram_lock = asyncio.Lock()
+        self.report_lock = asyncio.Lock()
+        self.report_pending = False
+        self.report_retry = 0
 
     async def verify_telegram(self):
         async with self.telegram_lock:
@@ -59,8 +64,11 @@ class Monitor:
                 if status.get('state') != 'ready':
                     raise telegram_api.TelegramError(status.get('message', 'Сначала проверьте получателя.'))
                 destination = status['chat_id']
-            await telegram_api.request(self.http, token, 'sendMessage',
-                {'chat_id': destination, 'text': text[:4000], 'disable_web_page_preview': True})
+            for index, part in enumerate(reporting.chunks(text)):
+                if index:
+                    await asyncio.sleep(1.05)
+                await telegram_api.request(self.http, token, 'sendMessage',
+                    {'chat_id': destination, 'text': part, 'disable_web_page_preview': True})
             return True
         except telegram_api.TelegramError as exc:
             self.store.event(None, 'error', 'Telegram: ' + str(exc))
@@ -76,6 +84,11 @@ class Monitor:
                         task = asyncio.create_task(self.scheduled(pid))
                         self.running.add(task)
                         task.add_done_callback(self.running.discard)
+                if self.report_due() and not self.report_pending:
+                    self.report_pending = True
+                    task = asyncio.create_task(self.scheduled_report())
+                    self.running.add(task)
+                    task.add_done_callback(self.running.discard)
                 await asyncio.sleep(2)
         finally:
             for task in list(self.running):
@@ -92,6 +105,52 @@ class Monitor:
             self.store.event(pid, 'error', 'Фоновая проверка не завершилась. Повторите проверку вручную.')
         finally:
             self.pending.discard(pid)
+
+    def report_due(self, moment=None):
+        settings = self.store.settings()
+        current = reporting.local_time(moment)
+        return (settings.get('daily_report', True) and bool(settings['telegram_token'] and settings['telegram_chat'])
+                and current.hour >= 9 and settings.get('daily_report_sent_date') != current.date().isoformat()
+                and time.monotonic() >= self.report_retry)
+
+    async def scheduled_report(self):
+        try:
+            await self.daily_report()
+        except Exception:
+            self.store.event(None, 'error', 'Ежедневный отчёт не отправлен. Повтор через 5 минут.')
+        finally:
+            self.report_retry = time.monotonic() + 300
+            self.report_pending = False
+
+    async def daily_report(self, manual=False, moment=None):
+        async with self.report_lock:
+            if not manual and not self.report_due(moment):
+                return False
+            current = reporting.local_time(moment)
+            projects = self.store.projects()
+            report_errors = {}
+            for project in projects:
+                if project['enabled']:
+                    try:
+                        async with self.semaphore:
+                            await self.check(project['id'], report=True)
+                    except KeyError:
+                        pass
+                    except Exception:
+                        report_errors[project['id']] = 'Проверка для отчёта не завершилась; показаны последние сохранённые данные.'
+                        self.store.event(project['id'], 'error', 'Проверка для ежедневного отчёта не завершилась.')
+            projects = self.store.projects()
+            states = {p['id']:self.store.state(p['id']) for p in projects}
+            for pid, error in report_errors.items():
+                if pid in states:
+                    states[pid] = states[pid] | {'report_error':error}
+            counts = self.store.event_counts((current.astimezone(timezone.utc)-timedelta(days=1)).isoformat())
+            sent = await self.telegram(reporting.daily_text(projects, states, current, counts))
+            if sent:
+                if not manual:
+                    self.store.save_settings(self.store.settings() | {'daily_report_sent_date':current.date().isoformat()})
+                self.store.event(None, 'success', 'Ежедневный отчёт по проектам отправлен в Telegram.')
+            return sent
 
     def server_check(self, project):
         result = {}
@@ -116,7 +175,13 @@ class Monitor:
                 if project['git_monitor']:
                     try:
                         git = gitops.status(conn)
+                        git['files'] = reporting.file_metadata(conn, git.get('files', []))
                         result['git'] = git
+                        if project.get('_daily_report'):
+                            try:
+                                result['git_history'] = gitops.history(conn, self.store.settings())
+                            except RemoteError as exc:
+                                result['git_history'] = {'error':str(exc)}
                         if project['auto_sync'] and git['connected'] and git['files']:
                             if git.get('staged') or any(not f['allowed'] for f in git['files']):
                                 git['auto_error'] = 'Автосинхронизация остановлена: staged или потенциально секретные файлы.'
@@ -172,10 +237,12 @@ class Monitor:
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             return {'error': 'HTTP-проба недоступна или вернула неверные данные'}
 
-    async def check(self, pid):
+    async def check(self, pid, report=False):
         lock = self.locks.setdefault(pid, asyncio.Lock())
         async with lock:
             project = self.store.resolve_project(self.store.project(pid))
+            if report:
+                project = project | {'auto_sync':False, '_daily_report':True}
             previous = self.store.state(pid)
             state = {'checked_at': now()}
             if previous.get('pending_push'):
@@ -235,11 +302,12 @@ class Monitor:
                     if project['notify'] and self.store.settings()['notify_recovery']:
                         await self.telegram('✅ ' + project['name'] + ': проверки снова проходят')
             git = state.get('git', {})
-            if git.get('files') and git.get('snapshot') != previous.get('git', {}).get('snapshot'):
-                count = len(git['files'])
+            notification = reporting.file_messages(project['name'], git, previous.get('git', {}))
+            if notification:
+                count = git.get('total_files',len(git['files']))
                 self.store.event(pid, 'warning', 'На сервере обнаружено изменений: ' + str(count))
                 if project['notify']:
-                    await self.telegram('📝 ' + project['name'] + ': файлов с изменениями — ' + str(count))
+                    await self.telegram(notification)
             state['next_check_at'] = time.time() + project['interval']
             self.due[pid] = time.monotonic() + project['interval']
             self.store.save_state(pid, state)

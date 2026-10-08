@@ -621,7 +621,7 @@ $('#settings-form').addEventListener('submit', event => {
   event.preventDefault(); const form = event.currentTarget;
   busy($('button[type=submit]', form), async () => {
     const data = Object.fromEntries(new FormData(form));
-    ['notify_recovery','clear_telegram_token','disable_pin'].forEach(k=>data[k]=form.elements[k].checked);
+    ['notify_recovery','daily_report','clear_telegram_token','disable_pin'].forEach(k=>data[k]=form.elements[k].checked);
     if (!data.pin) delete data.pin;
     if (!data.telegram_token) delete data.telegram_token;
     await api('/settings', {method:'PUT',body:data}); await loadSettings(); toast('Настройки сохранены');
@@ -970,3 +970,7 @@ $('#git-debug-copy').onclick = event => busy(event.currentTarget, async () => {
   } catch { field.focus(); field.select(); toast('Нажмите Ctrl+C, чтобы скопировать выделенный отчёт'); }
 });
 $('#git-diagnostics-report').onclick = event => busy(event.currentTarget, () => gitAction('debug'));
+
+$('#send-daily-report').onclick = event => busy(event.currentTarget, async () => {
+  const result = await api('/telegram/report', {method:'POST'}); toast(result.message);
+});

@@ -97,7 +97,7 @@ def test_debug_report_is_authenticated_project_scoped_and_survives_failure(tmp_p
         response = client.get(f'/api/projects/{project}/git')
         assert response.status_code == 409
         report = client.get(f'/api/projects/{project}/git/debug').json()
-        assert report['version'] == '1.10.14'
+        assert report['version'] == '1.10.15'
         assert report['records'][0]['result'] == 'output_limit'
         assert report['records'][0]['command'] == 'git rev-parse'
         assert 'never-save-this-token' not in json.dumps(report)
