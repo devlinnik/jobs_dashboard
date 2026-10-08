@@ -142,6 +142,10 @@ def network(conn, arguments, remote):
     """Supply credentials through SSH stdin and process environment, never URL/argv/disk."""
     validate_remote(remote)
     network_timeout = 600 if arguments.startswith(('push ', 'fetch ')) else 90
+    # Hosting limits also apply to pack creation during fetch/push, not only add.
+    local_git = ('git -c core.preloadIndex=false -c index.threads=1 -c pack.threads=1 '
+                 '-c pack.windowMemory=32m -c pack.deltaCacheSize=16m '
+                 if getattr(conn, 'project', {}).get('hosting', False) else 'git ')
     getattr(conn, 'report_progress', lambda *args: None)('Отправка коммитов' if arguments.startswith('push ') else 'Проверка удалённого репозитория', 0, 0)
     profile = getattr(conn, 'git_profile', None)
     # The server may select a non-default key using core.sshCommand. A fixed
@@ -158,7 +162,7 @@ def network(conn, arguments, remote):
               'GIT_SSH_COMMAND="$devlin_git_ssh -o BatchMode=yes -o StrictHostKeyChecking=yes" ')
 
     if not profile:
-        return conn.run(setup + common + 'git ' + arguments, timeout=network_timeout)
+        return conn.run(setup + common + local_git + arguments, timeout=network_timeout)
     repository_path(profile, remote)  # Never send a profile's token to another service.
     version = conn.text('git --version').strip()
     match = re.search(r'(\d+)\.(\d+)', version)
@@ -186,7 +190,7 @@ def network(conn, arguments, remote):
     for index, (key, value) in enumerate(config):
         script += f'GIT_CONFIG_KEY_{index}=' + shlex.quote(key) + ' '
         script += f'GIT_CONFIG_VALUE_{index}=' + ('"Authorization: Basic $DEVLIN_GIT_AUTH"' if value is None else shlex.quote(value)) + ' '
-    script += 'git -c protocol.file.allow=never -c protocol.ext.allow=never ' + arguments
+    script += local_git + '-c protocol.file.allow=never -c protocol.ext.allow=never ' + arguments
     return conn.run(script, timeout=network_timeout, input_data=(authorization + '\n').encode())
 
 
@@ -996,7 +1000,7 @@ def push(conn, request=None, settings=None):
     # Pin the reviewed commit and destination: a concurrent server commit must not
     # silently enter this push after the final HEAD check.
     revision = outgoing['head'] + ':refs/heads/' + outgoing['branch']
-    code, _, _ = network(conn, 'push origin ' + shlex.quote(revision), remote)
+    code, out, err = network(conn, 'push origin ' + shlex.quote(revision), remote)
     if code:
-        raise RemoteError('Push не выполнен. Проверьте Git-доступ, права выбранной ветки и расхождение истории.')
+        raise command_failure(code, err + b'\n' + out, 'Отправка коммитов в origin')
     return {'message': 'Коммиты отправлены в текущую ветку origin'}

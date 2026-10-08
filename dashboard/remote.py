@@ -49,9 +49,9 @@ def command_failure(code, err, context=''):
     if 'disk quota exceeded' in text or 'no space left on device' in text:
         reason = 'Исчерпана квота хостинга или место на диске. Проверьте тариф в панели хостинга; освободите место перед повтором. Размер общего диска не показывает квоту аккаунта.'
     elif any(value in text for value in ('unable to create thread', 'cannot create async thread', 'pthread_create', 'resource temporarily unavailable', 'unable to fork', 'cannot fork')):
-        reason = 'Хостинг ограничил создание потоков или процессов. В SSH-профиле включите режим хостинга: добавление файлов и коммит будут выполняться с одним потоком Git. Проверьте лимиты процессов аккаунта в панели хостинга.'
+        reason = 'Хостинг ограничил создание потоков или процессов. В SSH-профиле включите режим хостинга: добавление, коммит, загрузка и отправка будут выполняться с ограничением потоков Git. Проверьте лимиты процессов аккаунта в панели хостинга.'
     elif any(value in text for value in ('cannot allocate memory', 'out of memory', 'unable to mmap', 'malloc failed')):
-        reason = 'Git не хватило памяти в пределах лимитов аккаунта хостинга. Закройте лишние процессы или увеличьте лимит памяти; попробуйте добавлять файлы небольшими группами.'
+        reason = 'Git не хватило памяти в пределах лимитов аккаунта хостинга. В SSH-профиле включите режим хостинга, который ограничивает потоки и память упаковки при отправке. Если он уже включён, проверьте лимит памяти аккаунта и лишние процессы.'
     elif 'too many open files' in text:
         reason = 'Достигнут лимит открытых файлов аккаунта хостинга. Проверьте лимиты и работающие процессы в панели хостинга.'
     elif any(value in text for value in ('index file corrupt', 'index file smaller than expected', 'invalid index', 'bad index file', 'invalid object', 'bad object')):
@@ -72,8 +72,20 @@ def command_failure(code, err, context=''):
         reason = 'Не удалось создать или подписать объект коммита. Проверьте квоту и права .git/objects, а также commit.gpgsign и ключ подписи на сервере. Изменения в индексе сохранены.'
     elif 'read-only file system' in text or 'operation not permitted' in text:
         reason = 'Файловая система или файлы Git недоступны для записи. Проверьте права и ограничения хостинга.'
-    elif 'non-fast-forward' in text or 'rejected' in text:
-        reason = 'Push отклонён: история веток разошлась или ветка защищена. Force push не выполняется.'
+    elif any(value in text for value in ('gh001', 'exceeds github', 'large files detected', 'file exceeds', 'exceeds the maximum allowed', 'file size limit')):
+        reason = 'Git-хостинг отклонил слишком большой файл в отправляемых коммитах. Для GitHub обычный Git допускает файлы до 100 МиБ. Добавление в .gitignore после коммита не убирает файл из истории. Нужен перенос файла в Git LFS или исправление ещё не отправленных коммитов; повтор push без этого не поможет.'
+    elif 'workflow' in text and any(value in text for value in ('without', 'scope', 'permission', 'refusing to allow')):
+        reason = 'Токен не разрешает изменение GitHub Actions (.github/workflows). В Git-профиле обновите токен: для classic PAT нужен scope workflow вместе с repo; для fine-grained PAT — Contents и Workflows с правом записи для выбранного репозитория.'
+    elif any(value in text for value in ('gh006', 'gh013', 'protected branch', 'protected branch hook', 'repository rule', 'push declined due to repository')):
+        reason = 'Отправка отклонена правилами или защитой ветки Git-хостинга. Возможны обязательный Pull/Merge Request, подпись коммитов или запрет секретов. Проверьте правила ветки и разрешённый способ отправки в GitHub/GitLab. Force push не выполняется.'
+    elif any(value in text for value in ('write access to repository not granted', 'not allowed to push', 'permission to', 'http 403', 'requested url returned error: 403')):
+        reason = 'Чтение репозитория доступно, но запись запрещена. В Git-профиле проверьте аккаунт и токен: GitHub — доступ к выбранному репозиторию и Contents: Read and write (classic PAT: repo); GitLab — write_repository. Аккаунт также должен иметь право записи, а токен — нужное одобрение организации/SSO.'
+    elif 'non-fast-forward' in text or 'fetch first' in text:
+        reason = 'На origin появились новые коммиты. Обновите список и используйте «Объединить историю с origin» либо «Загрузить из Git» для чистого проекта. Force push не выполняется.'
+    elif any(value in text for value in ('rpc failed', 'remote end hung up', 'unexpected disconnect', 'connection reset', 'http 413', 'requested url returned error: 413', 'early eof')):
+        reason = 'Передача Git прервана сетью, прокси или лимитом размера запроса. Проверьте доступность Git-хостинга и лимиты хостинга. Обновите список с origin перед повтором: отправка могла успеть завершиться.'
+    elif 'rejected' in text or 'pre-receive hook declined' in text:
+        reason = 'Git-хостинг отклонил отправку серверной проверкой. Проверьте правила ветки, ограничения файлов и права записи. Точная проверка не распознана; сохраните «Отчёт Git». Force push не выполняется.'
     elif 'permission denied' in text or 'authentication failed' in text or 'insufficient permission' in text:
         reason = 'Нет доступа. Проверьте SSH-пользователя, владельца и права записи .git, включая objects/refs; для сетевых операций — Git-профиль или SSH-ключ Git-хостинга.'
     elif 'host key verification failed' in text:
