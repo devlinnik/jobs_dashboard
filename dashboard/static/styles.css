@@ -70,3 +70,5 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
 
 .operation-region{inset:auto;top:18px;left:50%;margin:0;padding:0;border:0;background:transparent;overflow:visible}
 .operation-region::backdrop{background:transparent;pointer-events:none}
+
+.error-panel > #git-recovery-panel{margin-top:16px}

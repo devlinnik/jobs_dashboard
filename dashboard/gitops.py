@@ -47,6 +47,22 @@ def raw_output(conn, command):
     return out
 
 
+def remote_digest(conn, command):
+    """Hash an arbitrary stream on the server without hiding producer errors."""
+    script = ('devlin_digest_dir=$(mktemp -d "${TMPDIR:-/tmp}/devlin-git-digest.XXXXXX") || exit; '
+              'trap \'rm -rf -- "$devlin_digest_dir"\' EXIT; '
+              '( ' + command + '; devlin_digest_code=$?; '
+              'printf "%s\\n" "$devlin_digest_code" > "$devlin_digest_dir/status" ) | sha256sum; '
+              'devlin_hash_code=$?; test "$devlin_hash_code" -eq 0 || exit "$devlin_hash_code"; '
+              'test -s "$devlin_digest_dir/status" || exit 1; '
+              'read -r devlin_digest_code < "$devlin_digest_dir/status"; exit "$devlin_digest_code"')
+    code, out, err = conn.run(script)
+    digest = out.split()[0].decode('ascii', errors='replace') if out.split() else ''
+    if not code and not re.fullmatch(r'[0-9a-f]{64}', digest):
+        return 1, '', b'Invalid SHA256 response'
+    return code, digest if not code else '', err
+
+
 def safe_file(path):
     p = PurePosixPath(path)
     if not path or p.is_absolute() or '..' in p.parts or any(c in path for c in '\x00\r\n'):
@@ -322,7 +338,11 @@ def status(conn, include_snapshot=True):
         except RemoteError:
             remote = '(адрес скрыт: небезопасный URL; настройте SSH remote на сервере)'
     staged = any(f['status'][0] not in (' ', '?') for f in files)
-    index_snapshot = hashlib.sha256(raw_output(conn, 'git ls-files --stage -z')).hexdigest() if staged and include_snapshot else ''
+    index_snapshot = ''
+    if staged and include_snapshot:
+        index_code, index_snapshot, index_error = remote_digest(conn, 'git ls-files --stage -z')
+        if index_code:
+            raise command_failure(index_code, index_error, 'Проверка индекса Git')
     return {'connected': True, 'files': files, 'snapshot': snapshot(conn, raw, files, head) if include_snapshot else '',
             'branch': branch, 'head': head[:12], 'remote': remote,
             'staged': staged, 'index_snapshot': index_snapshot}
@@ -413,7 +433,7 @@ def recovery(conn):
             structure['head_valid'] = head_valid
             if not head_valid:
                 checks.append({'ok': False, 'message': '.git/HEAD имеет неверный формат: Git не может определить текущую ветку.'})
-        config_code, _, _ = conn.run('git config --file .git/config --list')
+        config_code, _, _ = conn.run('git config --file .git/config --list >/dev/null')
         structure['config_code'] = config_code
         if structure['config'] == 0 and config_code:
             checks.append({'ok': False, 'message': '.git/config содержит некорректные настройки. Его содержимое сохранится в резервной копии.'})
@@ -438,8 +458,8 @@ def recovery(conn):
         checks.append({'ok': None, 'message': 'Нельзя безопасно изменить права .git: внутри есть чужие файлы, ссылки или недоступные папки. Выберите SSH-профиль владельца проекта в настройках; приложение не может получить права другого пользователя.'})
     backup_base = ''
     if structure and own_code == 0 and mode_code == 0 and not modes:
-        manifest_code, manifest, _ = conn.run("find .git -xdev -printf '%P:%y:%s:%T@:%m:%u:%g\\0'")
-        structure['manifest'] = hashlib.sha256(manifest).hexdigest() if manifest_code == 0 else ''
+        manifest_code, manifest, _ = remote_digest(conn, "find .git -xdev -printf '%P:%y:%s:%T@:%m:%u:%g\\0'")
+        structure['manifest'] = manifest
         home_code, home_out, _ = conn.run('cd -- "$HOME" && pwd -P')
         home = home_out.decode('utf-8', errors='replace').strip()
         if home_code == 0 and home.startswith('/') and home != '/' and not any(c in home for c in '\0\r\n'):
@@ -456,12 +476,16 @@ def recovery(conn):
                                     (structure.get('config') == 0 and config_code != 0))
                 if branch and broken_structure:
                     structure['branch'] = branch
-                    refs_code, refs, _ = conn.run('find .git/refs/heads -type f -print; test ! -f .git/packed-refs || cat .git/packed-refs')
+                    refs_code, refs, _ = conn.run(
+                        'find .git/refs/heads -type f -print -quit || exit; '
+                        'test ! -f .git/refs/heads/' + shlex.quote(branch) + ' || printf "chosen\\n"; '
+                        'if test -f .git/packed-refs; then awk -v chosen=' + shlex.quote('refs/heads/' + branch) +
+                        ' \'$2 == chosen { found=1 } $2 ~ /^refs\\// { any=1 } '
+                        'END { if (any) print "refs"; if (found) print "chosen" }\' .git/packed-refs; fi')
                     # Restore HEAD only when the chosen branch exists, or no
                     # branches exist yet. Do not guess among existing histories.
-                    has_branch = (('.git/refs/heads/' + branch).encode() in refs.splitlines() or
-                                  any(line.endswith((' refs/heads/' + branch).encode()) for line in refs.splitlines()))
-                    other_branches = bool(refs.strip())
+                    has_branch = refs_code == 0 and b'chosen' in refs.splitlines()
+                    other_branches = refs_code != 0 or bool(refs.strip())
                     if (structure['HEAD'] == 41 or structure.get('head_valid') is False) and structure['objects'] == 0 and structure['refs'] == 0 and config_code == 0 and (has_branch or not other_branches):
                         actions.append({'id':'restore-head','label':'Восстановить HEAD',
                             'description':'Сохранить копию метаданных в ' + backup_base + ' и восстановить ссылку HEAD на ветку ' + branch + '. Объекты Git, индекс, коммиты и файлы сайта сохраняются.'})

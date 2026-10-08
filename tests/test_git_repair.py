@@ -11,6 +11,47 @@ from tests.test_git import LocalConnection, git, repo, POSIX_ONLY
 pytestmark = POSIX_ONLY
 
 
+def test_remote_digest_streams_large_output_and_preserves_producer_failure(tmp_path):
+    import hashlib
+    payload = b'x' * 3_000_000
+    (tmp_path/'large').write_bytes(payload)
+    conn = LocalConnection(tmp_path, {'TMPDIR':str(tmp_path)})
+    code, digest, _ = gitops.remote_digest(conn, 'cat large')
+    assert code == 0 and digest == hashlib.sha256(payload).hexdigest()
+    code, digest, _ = gitops.remote_digest(conn, 'cat large; (exit 47)')
+    assert code == 47 and digest == ''
+    assert not list(tmp_path.glob('devlin-git-digest.*'))
+
+
+def test_large_config_and_packed_refs_do_not_overflow_recovery(repo, tmp_path):
+    work, conn = repo
+    conn.env['HOME'] = str(tmp_path)
+    head = git(work, 'rev-parse', 'HEAD')
+    (work/'.git/HEAD').unlink()
+    with (work/'.git/config').open('a') as config:
+        config.write('\n[custom]\n large = ' + 'x'*2_100_000 + '\n')
+    (work/'.git/packed-refs').write_text(''.join(
+        head + ' refs/heads/branch-' + str(i) + '\n' for i in range(40000)))
+    report = gitops.recovery(conn)
+    assert 'restore-head' in {a['id'] for a in report['actions']}
+    assert not (work/'.git/HEAD').exists()
+
+
+def test_large_metadata_diagnostics_remain_bounded_and_detect_changes(tmp_path):
+    work = tmp_path/'broken'; work.mkdir(); (work/'.git').mkdir()
+    # The former complete manifest is larger than the real SSH response limit.
+    for i in range(8000):
+        (work/'.git'/('metadata-' + str(i) + '-' + 'x'*230)).touch()
+    conn = LocalConnection(work, {'HOME':str(tmp_path), 'TMPDIR':str(tmp_path)})
+    report = gitops.diagnostics(conn, {})
+    assert 'archive-reinitialize' in {a['id'] for a in report['actions']}
+    (work/'.git/new-metadata').write_text('changed')
+    with pytest.raises(RemoteError, match='изменилось'):
+        gitops.repair(conn, request(report, 'archive-reinitialize'))
+    assert (work/'.git/new-metadata').read_text() == 'changed'
+    assert not list(tmp_path.glob('devlin-git-digest.*'))
+
+
 def request(report, action, **changes):
     return SimpleNamespace(**({'action':action, 'snapshot':report['repair_snapshot'], 'confirm':True} | changes))
 
