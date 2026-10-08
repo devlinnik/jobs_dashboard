@@ -11,7 +11,7 @@ using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 [assembly: AssemblyTitle("Devlin Desk Launcher")]
-[assembly: AssemblyVersion("1.10.3.0")]
+[assembly: AssemblyVersion("1.10.4.0")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8")]
 namespace DevlinInstaller {
     internal static class Program {
@@ -178,7 +178,7 @@ namespace DevlinInstaller {
             string logs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"DevlinDeskLauncher\logs"); Directory.CreateDirectory(logs);
             logpath = Path.Combine(logs, DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".log"); logfile = new StreamWriter(logpath, false, new UTF8Encoding(false)) { AutoFlush = true };
             var logLabel = new Label { Text = "Журнал: " + logpath, AutoEllipsis = true, Dock = DockStyle.Fill }; layout.Controls.Add(logLabel, 0, 9); layout.SetColumnSpan(logLabel, 3);
-            Append("Devlin Desk Launcher 1.10.3 — Windows x64"); SetBusy(false);
+            Append("Devlin Desk Launcher 1.10.4 — Windows x64"); SetBusy(false);
             target.TextChanged += delegate { if (!busy) SetBusy(false); };
             FormClosing += delegate(object sender, FormClosingEventArgs e) { if (busy) { e.Cancel = true; status.Text = "Дождитесь завершения установки. Ход работы виден в журнале."; } };
             FormClosed += delegate { logfile.Dispose(); };

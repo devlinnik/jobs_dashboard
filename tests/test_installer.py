@@ -209,12 +209,31 @@ def test_legacy_installation_upgrades_to_clean_layout(tmp_path):
     assert (backup/'_internal').is_dir() and (backup/'_maintenance').is_dir()
 
 
-@pytest.mark.parametrize('name',['../escape.txt','/absolute.txt','root/../../escape.txt','C:/escape.txt','root\\escape.txt'])
+@pytest.mark.parametrize('name',['../escape.txt','/absolute.txt','root/../../escape.txt','C:/escape.txt','root\\escape.txt','root/file\0hidden.txt'])
 def test_source_zip_rejects_unsafe_paths(tmp_path,name):
     archive=tmp_path/'source.zip'
-    with zipfile.ZipFile(archive,'w') as z: z.writestr(name,'unsafe')
+    # ZipInfo(name) silently normalizes backslashes on Windows. Write the raw
+    # name explicitly so this fixture really contains the invalid ZIP entry.
+    entry = zipfile.ZipInfo('placeholder')
+    entry.filename = entry.orig_filename = name
+    with zipfile.ZipFile(archive,'w') as z: z.writestr(entry,'unsafe')
     with pytest.raises(installer.InstallError): installer.extract_archive(archive,tmp_path/'extract')
     assert not (tmp_path/'escape.txt').exists()
+
+
+def test_source_zip_validates_original_name_before_windows_normalization(tmp_path, monkeypatch):
+    archive = tmp_path/'source.zip'
+    entry = zipfile.ZipInfo('placeholder')
+    entry.filename = entry.orig_filename = 'root\\escape.txt'
+    with zipfile.ZipFile(archive,'w') as z: z.writestr(entry,'unsafe')
+    original = zipfile.ZipInfo.__init__
+    def windows_init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        self.filename = self.filename.replace('\\', '/')
+    monkeypatch.setattr(zipfile.ZipInfo, '__init__', windows_init)
+    with pytest.raises(installer.InstallError, match='Unsafe'):
+        installer.extract_archive(archive,tmp_path/'extract')
+    assert not (tmp_path/'extract').exists()
 
 
 def test_source_zip_rejects_symlinks_and_accepts_single_root(tmp_path):

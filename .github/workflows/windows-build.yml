@@ -19,8 +19,8 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Install test dependencies
@@ -47,11 +47,11 @@ jobs:
           $result = Get-Content $report -Raw | ConvertFrom-Json
           if (-not $result.ok) { throw 'Packaged readiness report is invalid' }
           if ('embedded-exe-icon' -notin $result.checks) { throw 'Embedded EXE icon was not verified' }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: DevlinDesk-Windows
           path: dist/DevlinDesk/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: DevlinLauncher-Windows
           path: DevlinLauncher.exe

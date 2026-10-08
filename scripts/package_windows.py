@@ -154,8 +154,11 @@ def extract_archive(archive, destination):
             raise InstallError('Source archive is too large.')
         roots = set()
         for item in members:
-            path = PurePosixPath(item.filename)
-            if not path.parts or path.is_absolute() or '..' in path.parts or '\\' in item.filename or ':' in path.parts[0]:
+            # ZipInfo normalizes backslashes on Windows and truncates at NUL.
+            # Validate the original central-directory name before that loss.
+            original = item.orig_filename
+            path = PurePosixPath(original)
+            if not path.parts or path.is_absolute() or '..' in path.parts or '\\' in original or '\0' in original or ':' in path.parts[0] or original != item.filename:
                 raise InstallError('Unsafe source archive path.')
             if stat.S_ISLNK(item.external_attr >> 16):
                 raise InstallError('Symbolic links in source archives are not allowed.')
