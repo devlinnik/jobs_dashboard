@@ -277,11 +277,11 @@ def candidates(conn):
 
 
 def status(conn, include_snapshot=True):
-    code, _, _ = conn.run('git rev-parse --is-inside-work-tree')
+    code, out, err = conn.run('git rev-parse --is-inside-work-tree')
     if code:
         metadata, _, _ = conn.run('test -e .git || test -L .git')
         if metadata == 0:
-            raise RemoteError('В папке уже есть .git, но Git не смог открыть репозиторий. Проверьте права, владельца, safe.directory и состояние .git. Существующая история не изменена.')
+            raise command_failure(code, err + b'\n' + out, 'В папке уже есть .git, но репозиторий недоступен. Запустите диагностику и исправление в приложении')
         files = candidates(conn) if include_snapshot else []
         raw = json.dumps(files, sort_keys=True)
         return {'connected': False, 'files': files, 'snapshot': snapshot(conn, raw, files) if include_snapshot else '', 'branch': '', 'head': '', 'remote': ''}
@@ -373,6 +373,108 @@ def author_identity(conn, settings):
     return {'name': settings['git_name'], 'email': settings['git_email'], 'source': 'Настройки приложения'}
 
 
+def recovery(conn):
+    """Offer only bounded repairs justified by the current remote observations."""
+    checks, actions = [], []
+    root = conn.text('pwd -P').strip()
+    uid = conn.text('id -u').strip()
+    if not root.startswith('/') or any(c in root for c in '\0\r\n') or not uid.isdigit():
+        raise RemoteError('Не удалось безопасно определить папку проекта и SSH-пользователя')
+    # Git status may create/remove index.lock while refreshing its cache. Do not
+    # bind repairs to directory mtime changed by our own read operations.
+    meta_code, meta, _ = conn.run("stat -c '%d:%i:%u:%g:%a' -- .git")
+    code, out, err = conn.run('git rev-parse --is-inside-work-tree')
+    error = (err + b'\n' + out).decode('utf-8', errors='replace').lower()
+    quoted = shlex.quote(root)
+    if code and ('dubious ownership' in error or 'unsafe repository' in error):
+        checks.append({'ok': False, 'message': 'Git блокирует проект из-за другого владельца папки. Можно разрешить только эту папку для текущего SSH-пользователя.'})
+        test_code, test_root, _ = conn.run('git -c safe.directory=' + quoted + ' rev-parse --show-toplevel')
+        if test_code == 0 and test_root.decode('utf-8', errors='replace').strip() == root:
+            actions.append({'id': 'trust-directory', 'label': 'Доверять папке проекта',
+                'description': 'Добавить ' + root + ' в safe.directory текущего SSH-пользователя. Разрешение касается только этого проекта. Файлы, владельцы и коммиты сохраняются.'})
+    elif code and meta_code == 0:
+        checks.append({'ok': False, 'message': str(command_failure(code, err + b'\n' + out, 'Открытие существующего Git'))})
+        checks.append({'ok': None, 'message': 'Приложение сохраняет существующую .git. Она не будет удалена или заменена новым репозиторием.'})
+    # A recursive chmod is offered only for a traversable, wholly user-owned,
+    # non-symlink metadata tree. Worktree files and permissions of others stay intact.
+    own_code, _, _ = conn.run('test -d .git && ! test -L .git && '
+        'test -z "$(find .git -xdev \\( -type l -o ! -uid ' + uid + ' \\) -print -quit)" && '
+        'find .git -xdev -type d -print >/dev/null')
+    mode_code, modes, _ = conn.run('find .git -xdev \\( -type f ! -perm -u+r -o '
+        '-type d \\( ! -perm -u+r -o ! -perm -u+w -o ! -perm -u+x \\) \\) -print -quit')
+    if meta_code == 0 and own_code == 0 and mode_code == 0 and modes:
+        checks.append({'ok': False, 'message': 'Владелец файлов .git — текущий SSH-пользователь, но у владельца не хватает прав чтения, записи или прохода по папкам.'})
+        actions.append({'id': 'owner-permissions', 'label': 'Восстановить права владельца .git',
+            'description': 'Добавить владельцу чтение файлов .git и чтение, запись и проход по её папкам. Права остальных пользователей, содержимое файлов и история сохраняются; Git-объекты остаются защищены от изменения.'})
+    if meta_code == 0 and own_code != 0:
+        checks.append({'ok': None, 'message': 'Нельзя безопасно изменить права .git: внутри есть чужие файлы, ссылки или недоступные папки. Выберите SSH-профиль владельца проекта в настройках; приложение не может получить права другого пользователя.'})
+    remote = ''
+    if code == 0:
+        _, raw_remote, _ = conn.run('git config --get remote.origin.url')
+        remote = raw_remote.decode('utf-8', errors='replace').strip()
+        profile = getattr(conn, 'git_profile', None)
+        if profile and remote and not remote.startswith('https://'):
+            checks.append({'ok': False, 'message': 'Выбран Git-профиль с HTTPS-токеном, но origin использует SSH. Можно проверить токен и переключить адрес этого же репозитория на HTTPS.'})
+            try:
+                target = profile_https_url(profile, remote)
+                actions.append({'id': 'profile-https', 'label': 'Подключить через Git-профиль',
+                    'description': 'Проверить доступ к ' + target + ' с токеном выбранного профиля и заменить адреса fetch/push origin только после успешной проверки. Коммиты, файлы, ветка и автор сохраняются.'})
+            except RemoteError:
+                checks.append({'ok': False, 'message': 'SSH-адрес относится к другому сервису или не поддерживается. Выберите подходящий Git-профиль или репозиторий в настройках подключения.'})
+    profile = getattr(conn, 'git_profile', {}) or {}
+    project = getattr(conn, 'project', {})
+    snapshot = hashlib.sha256(json.dumps([root, uid, meta_code, meta.hex(), code, remote,
+        {key:project.get(key, '') for key in ('id','ssh_host','ssh_port','ssh_user','ssh_fingerprint','git_profile_id')},
+        profile.get('id', ''), profile.get('base_url', ''), actions], sort_keys=True).encode()).hexdigest()
+    return {'checks': checks, 'actions': actions, 'repair_snapshot': snapshot}
+
+
+def profile_https_url(profile, remote):
+    validate_remote(remote)
+    base = urlsplit(profile['base_url'])
+    match = re.fullmatch(r'git@([a-zA-Z0-9_.-]+):([a-zA-Z0-9_./-]+)', remote)
+    parsed = urlsplit(remote) if not match else None
+    host = match[1] if match else parsed.hostname if parsed.scheme == 'ssh' and parsed.username == 'git' else ''
+    path = match[2] if match else parsed.path.lstrip('/')
+    if not host or host.lower() != base.hostname.lower():
+        raise RemoteError('SSH-репозиторий и Git-профиль относятся к разным сервисам')
+    target = 'https://' + base.netloc + '/' + path
+    repository_path(profile, target)
+    return target
+
+
+def repair(conn, request):
+    if not request.confirm:
+        raise RemoteError('Подтвердите исправление Git в приложении')
+    current = recovery(conn)
+    if request.snapshot != current['repair_snapshot']:
+        raise RemoteError('Состояние Git изменилось. Повторите диагностику перед исправлением.')
+    if request.action not in {a['id'] for a in current['actions']}:
+        raise RemoteError('Для текущей проблемы это исправление недоступно. Повторите диагностику.')
+    if request.action == 'trust-directory':
+        root = conn.text('pwd -P').strip()
+        conn.text('git config --global --add safe.directory ' + shlex.quote(root), context='Разрешение папки Git')
+    elif request.action == 'owner-permissions':
+        # Never traverse symlinks or mount points; only entries validated above.
+        conn.text('find .git -xdev -type d -exec chmod u+rwx -- {} + && '
+            'find .git -xdev -type f -exec chmod u+r -- {} +', context='Восстановление прав .git')
+    elif request.action == 'profile-https':
+        current_repo = status(conn)
+        target = profile_https_url(conn.git_profile, current_repo['remote'])
+        Provider(conn.git_profile, conn.git_token).repository(target)
+        code, out, err = network(conn, 'ls-remote ' + shlex.quote(target), target)
+        if code:
+            raise command_failure(code, err + b'\n' + out, 'Адрес origin сохранён; доступ с токеном не прошёл')
+        latest = recovery(conn)
+        if latest['repair_snapshot'] != request.snapshot:
+            raise RemoteError('Состояние Git изменилось во время проверки. Origin сохранён; повторите диагностику.')
+        conn.text('git remote set-url origin ' + shlex.quote(target))
+        conn.run('git config --unset-all remote.origin.pushurl')
+    # Verify the operation, without changing the index, worktree or history.
+    conn.text('git rev-parse --is-inside-work-tree', context='Проверка Git после исправления')
+    return {'ok': True, 'message': 'Настройки Git исправлены. Файлы и коммиты сохранены. Обновите состояние репозитория.'}
+
+
 def diagnostics(conn, settings):
     """Read-only checks; never return arbitrary Git stderr or credentials."""
     checks = []
@@ -380,14 +482,16 @@ def diagnostics(conn, settings):
     checks.append({'ok': code == 0, 'message': 'Git установлен.' if code == 0 else 'Git не найден на сервере.'})
     if code:
         return {'checks': checks}
+    recovered = recovery(conn)
+    checks.extend(recovered['checks'])
     try:
         current = status(conn, include_snapshot=False)
     except RemoteError as exc:
         checks.append({'ok': False, 'message': str(exc)})
-        return {'checks': checks}
+        return {**recovered, 'checks': checks}
     if not current['connected']:
         checks.append({'ok': False, 'message': 'В корне проекта ещё нет Git-репозитория.'})
-        return {'checks': checks}
+        return {**recovered, 'checks': checks}
     access = access_settings(conn)
     if current['remote'].startswith('https://') and not getattr(conn, 'git_profile', None):
         checks.append({'ok': False, 'message': 'origin использует HTTPS: серверный SSH-ключ здесь не применяется. GitHub не принимает пароль аккаунта для Git. Выберите SSH URL через «Настроить подключение репозитория» или назначьте Git-профиль с токеном.'})
@@ -412,7 +516,7 @@ def diagnostics(conn, settings):
     signing = code == 0 and out.strip() == b'true'
     checks.append({'ok': not signing, 'message': 'Подпись коммитов включена: SSH-сеансу нужен доступный ключ GPG/SSH. Если подпись не нужна, настройте commit.gpgsign=false вручную для этого проекта.' if signing else 'Обязательная подпись коммитов не включена.'})
     checks.append({'ok': None, 'message': 'Проверка прав не гарантирует запись при исчерпанной квоте. При ошибке 128 проверьте квоту в панели хостинга и сообщения Git. Диагностика не создаёт коммит и не изменяет файлы.'})
-    return {'checks': checks}
+    return {**recovered, 'checks': checks}
 
 
 def log_commits(conn, revision):

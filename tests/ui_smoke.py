@@ -73,7 +73,9 @@ def main():
         (server_files/'cache').mkdir(); (server_files/'cache/result.txt').write_text('keep ignored')
         (server_files/'server.log').write_text('keep log')
         bare = git_host['bare']
-        ssh_port, key = stack.enter_context(ssh_server({'GIT_SSL_CAINFO':str(git_host['ca']), 'NO_PROXY':'127.0.0.1,localhost'}, home=str(temp), writable=True))
+        ssh_env = {'GIT_SSL_CAINFO':str(git_host['ca']), 'NO_PROXY':'127.0.0.1,localhost',
+                   'GIT_CONFIG_GLOBAL':str(temp/'ssh-gitconfig')}
+        ssh_port, key = stack.enter_context(ssh_server(ssh_env, home=str(temp), writable=True))
         with sync_playwright() as playwright:
             executable = os.environ.get('CHROMIUM_PATH')
             if not executable and Path('/usr/bin/chromium').exists(): executable = '/usr/bin/chromium'
@@ -82,7 +84,7 @@ def main():
             errors = []; page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(url)
             expect(page.locator('#app-shell')).to_be_visible()
-            expect(page.locator('#app-version')).to_have_text('v1.10.7')
+            expect(page.locator('#app-version')).to_have_text('v1.10.8')
             assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == 'light'
             assert page.evaluate("parseFloat(getComputedStyle(document.body).fontSize)") >= 16
             page.locator('[data-nav=ssh-profiles]').click()
@@ -239,7 +241,7 @@ def main():
             page.locator('[data-git-action=check]').click()
             expect(page.get_by_text('Репозиторий не подключён. Выберите его через кнопку «Подключить репозиторий».',exact=True)).to_be_visible()
             page.locator('[data-git-action=attach]').click()
-            expect(page.locator('#git-connect-info')).to_contain_text('Версия приложения: v1.10.7')
+            expect(page.locator('#git-connect-info')).to_contain_text('Версия приложения: v1.10.8')
             expect(page.locator('#git-server-key-field')).not_to_be_visible()
             expect(page.locator('#git-connect-auth-hint')).to_contain_text('HTTPS и токен')
             page.locator('#git-repository-picker').click()
@@ -251,6 +253,17 @@ def main():
             page.locator('#confirm-accept').click()
             expect(page.locator('#git-connect-dialog')).not_to_be_visible(timeout=20000)
             expect(page.locator('#detail-content')).to_contain_text(git_host['remote'])
+            # Force real Git's ownership guard in subsequent SSH sessions. Repair
+            # must be offered inline and write only the exact project trust entry.
+            ssh_env['GIT_TEST_ASSUME_DIFFERENT_OWNER'] = '1'
+            page.locator('[data-git-action=refresh]').click()
+            expect(page.locator('[data-git-repair="trust-directory"]')).to_be_visible(timeout=20000)
+            page.locator('[data-git-repair="trust-directory"]').click()
+            expect(page.locator('#confirm-dialog')).to_be_visible()
+            expect(page.locator('#confirm-description')).to_contain_text(str(server_files))
+            page.locator('#confirm-accept').click()
+            expect(page.locator('[data-git-action=commit]')).to_be_enabled(timeout=20000)
+            assert subprocess.check_output(['git','config','--file',str(temp/'ssh-gitconfig'),'--get-all','safe.directory']).decode().strip() == str(server_files)
             assert page.locator('.file-name').first.evaluate('node => parseFloat(getComputedStyle(node).fontSize)') >= 14
             page.locator('[data-git-action=check]').click()
             expect(page.get_by_text('Репозиторий подключён, доступ на чтение с сервера проверен. Право записи проверяется при push.',exact=True)).to_be_visible(timeout=20000)
@@ -287,8 +300,21 @@ def main():
                 raise
             expect(page.locator('#outgoing-commits .commit-row')).to_have_count(1, timeout=20000)
             expect(page.locator('#outgoing-commits')).to_contain_text('Browser Author')
-            assert subprocess.run(['git','-C',str(bare),'rev-parse','--verify','main'],capture_output=True).returncode != 0
             assert_toast_above_dialog(page, '#detail-dialog', 'создан на сервере')
+            subprocess.run(['git','-C',str(server_files),'remote','set-url','origin','git@127.0.0.1:team/project.git'],check=True)
+            page.locator('[data-git-action=refresh]').click()
+            expect(page.locator('[data-git-repair="profile-https"]')).to_be_visible(timeout=20000)
+            page.locator('[data-git-repair="profile-https"]').click()
+            expect(page.locator('#confirm-description')).to_contain_text(git_host['remote'])
+            page.locator('#confirm-accept').click()
+            try:
+                expect(page.locator('#git-history-panel [data-git-action=push]')).to_be_enabled(timeout=20000)
+            except AssertionError:
+                print('Git repair diagnostic:', page.locator('#detail-content').inner_text(), page.locator('#toast-region').inner_text())
+                raise
+            assert subprocess.check_output(['git','-C',str(server_files),'remote','get-url','origin']).decode().strip() == git_host['remote']
+            assert subprocess.run(['git','-C',str(bare),'rev-parse','--verify','main'],capture_output=True).returncode != 0
+            assert_toast_above_dialog(page, '#detail-dialog', 'Настройки Git исправлены')
             page.screenshot(path=str(screenshot/'git-outgoing.png, gitignore-editor.png, hosting-quota.png, telegram-settings.png'), animations='disabled')
             page.locator('#git-history-panel [data-git-action=push]').click()
             expect(page.locator('#confirm-dialog')).to_be_visible()

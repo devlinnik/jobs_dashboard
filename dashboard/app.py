@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, field_validator
 from .store import Store, now
 from .security import Sessions, hash_pin, verify_pin
-from .models import ProjectInput, SettingsInput, SyncInput, InitInput, SSHProfileInput, GitProfileInput, GitAttachInput, GitPushInput, GitIgnoreInput, GitUnstageInput, web_url
+from .models import ProjectInput, SettingsInput, SyncInput, InitInput, SSHProfileInput, GitProfileInput, GitAttachInput, GitPushInput, GitIgnoreInput, GitUnstageInput, GitRepairInput, web_url
 from .remote import connect, inspect_host, RemoteError
 from .monitor import Monitor, probe_script
 from . import gitops
@@ -517,6 +517,12 @@ def create_app(directory=None, start_monitor=True):
     @app.get('/api/projects/{pid}/git/diagnostics', dependencies=auth)
     async def git_diagnostics(pid: str):
         return await operation(pid, gitops.diagnostics, store.settings())
+
+    @app.post('/api/projects/{pid}/git/repair', dependencies=auth)
+    async def git_repair(pid: str, body: GitRepairInput):
+        result = await operation(pid, gitops.repair, body)
+        store.event(pid, 'info', result['message'])
+        return result
 
     @app.get('/api/projects/{pid}/git/commits', dependencies=auth)
     async def git_commits(pid: str):

@@ -340,10 +340,38 @@ async function loadGit() {
     if (id !== selectedId || activeTab !== 'git') return;
     gitData = data; gitHistory = null; renderGit(); mountGitIgnore(); await loadGitHistory(true);
   } catch (error) {
-    if (id === selectedId && activeTab === 'git') $('#detail-content').innerHTML = `<div class="error-panel">${escape(error.message)}<br><button class="button secondary" data-detail-action="edit">Настроить подключение</button> <button class="button secondary" data-detail-action="git">Повторить</button> <button class="button secondary" data-git-action="diagnostics">Диагностика Git</button></div>`;
-    if (id === selectedId && activeTab === 'git') mountGitIgnore();
+    if (id === selectedId && activeTab === 'git') {
+      $('#detail-content').innerHTML = `<div class="error-panel">${escape(error.message)}<br><button class="button secondary" data-detail-action="edit">Настроить подключение</button> <button class="button secondary" data-detail-action="git">Повторить</button> <button class="button secondary" data-git-action="diagnostics">Диагностика Git</button><section id="git-recovery-panel"></section></div>`;
+      mountGitIgnore(); await mountGitRecovery(id, $('#git-recovery-panel'));
+    }
   }
 }
+
+function recoveryMarkup(data, id, problemsOnly = false) {
+  const checks = problemsOnly ? data.checks.filter(c => c.ok !== true) : data.checks;
+  return checks.map(c => `<p class="git-info ${c.ok === false ? 'git-warning' : ''}">${escape(c.message)}</p>`).join('') +
+    (data.actions || []).map(a => `<div class="git-info"><p>${escape(a.description)}</p><button class="button primary" data-git-repair="${escape(a.id)}" data-repair-project="${escape(id)}" data-repair-snapshot="${escape(data.repair_snapshot)}" data-repair-description="${escape(a.description)}">${escape(a.label)}</button></div>`).join('');
+}
+async function mountGitRecovery(id, host) {
+  if (!host) return;
+  host.innerHTML = '<p class="hint">Определяем причину и доступные исправления…</p>';
+  try {
+    const data = await api(`/projects/${id}/git/diagnostics`);
+    if (id === selectedId && activeTab === 'git' && host.isConnected) host.innerHTML = recoveryMarkup(data, id, true);
+  } catch (error) { if (host.isConnected) host.textContent = error.message; }
+}
+document.addEventListener('click', event => {
+  const button = event.target.closest('[data-git-repair]');
+  if (!button) return;
+  busy(button, async () => {
+    const id = button.dataset.repairProject;
+    if (!await confirmAction(button.textContent.trim() + '?', button.dataset.repairDescription)) return;
+    const result = await api(`/projects/${id}/git/repair`, {method:'POST', body:{action:button.dataset.gitRepair, snapshot:button.dataset.repairSnapshot, confirm:true}});
+    toast(result.message);
+    if ($('#git-diagnostics-dialog').open) $('#git-diagnostics-dialog').close();
+    if (selectedId === id && activeTab === 'git') await loadGit();
+  });
+});
 function renderGit() {
   const g = gitData, p = getProject();
   $('#detail-content').innerHTML = `<div class="git-heading"><div><h3>${g.connected ? escape(g.branch) : 'Подключите репозиторий'}</h3><p>${g.connected ? escape(g.remote || 'origin не настроен') + (g.head ? ' · ' + escape(g.head) : '') : 'Файлы проекта уже на сервере. Выберите их для первого коммита.'}</p></div><div class="detail-actions" style="margin:0"><button class="button secondary small" data-git-action="diagnostics">Диагностика Git</button><button class="button secondary small" data-git-action="refresh">${icon('refresh')}Обновить</button>${g.connected ? `<button class="button secondary small" data-git-action="pull">${icon('git')}Загрузить из Git</button><button class="button secondary small" data-git-action="push">${icon('send')}Отправить коммиты</button>` : ''}</div></div><div class="git-info">${g.connected ? 'Отметьте файлы, проверьте diff и создайте коммит из текущих файлов на сервере. Push отправит его в текущую ветку origin, в том числе в GitLab.' : 'Создайте пустой репозиторий в GitLab или GitHub, затем выберите его через «Подключить репозиторий». Для первого импорта удалённый репозиторий должен быть пустым. Git-профиль либо доступы сервера должны разрешать запись.'}</div>${g.staged ? '<div class="git-info git-warning">Часть файлов уже подготовлена к коммиту на сервере. Поэтому «Создать коммит» временно недоступна. Уберите подготовку, затем выберите файлы заново. Содержимое файлов сохранится.<div class="detail-actions"><button class="button secondary" data-git-action="unstage">Убрать подготовку к коммиту</button></div></div>' : ''}${g.files.some(f=>!f.allowed) ? '<div class="git-info git-warning">Потенциально секретные файлы и зависимости исключены из синхронизации. Проверяйте содержимое разрешённых файлов — фильтр имени не обнаруживает все секреты.</div>' : ''}${!g.connected ? `<div class="fields"><label>URL репозитория<input id="git-remote" placeholder="git@gitlab.com:group/project.git"></label><label>Начальная ветка<input id="git-branch" value="${escape(p.git_branch || 'main')}" placeholder="main"></label></div>` : ''}${g.files.length ? `<div class="file-list"><div class="file-row"><label><input type="checkbox" id="select-all-files" checked><span>Выбрать все допустимые файлы (${g.files.filter(f=>f.allowed).length})</span></label></div>${g.files.map(f=>`<div class="file-row ${f.allowed ? '' : 'blocked'}"><label><input class="git-file" type="checkbox" value="${escape(f.path)}" ${f.allowed ? 'checked' : 'disabled'}><span class="file-status">${escape(f.status)}</span><span class="file-name" title="${escape(f.display_path || f.path)}">${escape(f.display_path || f.path)}${f.raw_path ? ' · имя в байтах' : ''}</span></label>${f.allowed ? `<button class="view-diff" data-file-diff="${escape(f.path)}">Посмотреть →</button>` : '<span class="badge warning">Исключён</span>'}</div>`).join('')}</div><div class="git-controls"><label>Сообщение коммита<input id="commit-message" value="${g.head ? 'Обновление файлов проекта' : 'Initial project import'}" maxlength="500" required></label><button class="button primary" data-git-action="commit" ${g.staged ? 'disabled title="Сначала уберите подготовку файлов к коммиту — кнопка находится над списком"' : ''}>${icon('git')}${g.connected ? 'Создать коммит' : 'Подключить и создать коммит'}</button></div><p class="hint">Коммит будет создан на сервере. Отправка выполняется отдельно из списка неотправленных коммитов.</p><pre id="file-diff" class="diff-view" hidden></pre>` : '<div class="events-empty">Рабочая директория чистая. Изменений для коммита нет.</div>'}<p class="hint">Без force push и перезаписи файлов. Отмена подготовки изменяет только индекс Git. «Загрузить из Git» использует pull --ff-only и требует чистую рабочую директорию. Изменившийся после просмотра набор файлов потребует нового подтверждения.</p>`;
@@ -364,7 +392,7 @@ $('#detail-content').addEventListener('click', event => {
 async function gitAction(action) {
   if (action === 'diagnostics') {
     const id = selectedId, result = await api(`/projects/${id}/git/diagnostics`);
-    $('#git-diagnostics-content').innerHTML = result.checks.map(c => `<p class="git-info ${c.ok === false ? 'git-warning' : ''}">${escape(c.message)}</p>`).join(''); $('#git-diagnostics-dialog').showModal(); return;
+    $('#git-diagnostics-content').innerHTML = recoveryMarkup(result, id); $('#git-diagnostics-dialog').showModal(); return;
   }
   if (action === 'ignore') return openGitIgnore();
   if (action === 'refresh') return loadGit();
@@ -427,6 +455,8 @@ async function loadGitHistory(refresh = false) {
   } catch (error) {
     if (!current()) return;
     gitHistory = {...(gitHistory || {commits:[],outgoing:[]}), error:error.message}; renderGitHistory();
+    $('#git-history-panel').insertAdjacentHTML('beforeend', '<section id="git-recovery-panel"></section>');
+    await mountGitRecovery(id, $('#git-recovery-panel'));
   }
 }
 function renderGitHistory() {

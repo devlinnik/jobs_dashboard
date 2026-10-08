@@ -213,6 +213,12 @@ class GitUnstageInput(BaseModel):
     confirm: bool = False
 
 
+class GitRepairInput(BaseModel):
+    action: str = Field(pattern='^(trust-directory|owner-permissions|profile-https)$')
+    snapshot: str = Field(min_length=64, max_length=64)
+    confirm: bool = False
+
+
 class SyncInput(BaseModel):
     snapshot: str
     files: list[str] = Field(min_length=1, max_length=2000)
